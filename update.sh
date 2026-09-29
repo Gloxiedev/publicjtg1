@@ -94,49 +94,60 @@ execute_step() {
     local log_file="/tmp/${step_id}.log"
     rm -f "$log_file"
     
+    local is_optional=0
+    case "$msg" in
+        *"Java"*) is_optional=1 ;;
+    esac
+
     printf "  ${CYAN}→${NC} %-44s " "$msg"
     "$@" > "$log_file" 2>&1 &
     local pid=$!
     
-    local elapsed=0
+    local start_time=$(date +%s 2>/dev/null || echo 0)
     local max_wait=360
     case "$msg" in
-        *"Java"*) max_wait=75 ;;
-        *"Requirement"*|*"dependencies"*) max_wait=120 ;;
-        *"PM2"*) max_wait=90 ;;
-        *"Node"*) max_wait=180 ;;
+        *"Java"*) max_wait=180 ;;
+        *"Requirement"*|*"dependencies"*) max_wait=180 ;;
+        *"PM2"*) max_wait=120 ;;
+        *"Node"*) max_wait=240 ;;
         *"Stopping"*) max_wait=30 ;;
-        *) max_wait=360 ;;
+        *) max_wait=600 ;;
     esac
 
     if [ -t 1 ]; then
         local spinstr='|/-\\'
         while kill -0 $pid 2>/dev/null; do
-            if [ $elapsed -ge $max_wait ]; then
-                echo " [Step exceeded timeout limit of ${max_wait}s]" >> "$log_file"
-                kill -TERM $pid 2>/dev/null || true
-                sleep 1
-                kill -9 $pid 2>/dev/null || true
-                break
+            local cur_time=$(date +%s 2>/dev/null || echo 0)
+            if [ "$start_time" -gt 0 ] && [ "$cur_time" -gt 0 ]; then
+                local elapsed=$((cur_time - start_time))
+                if [ $elapsed -ge $max_wait ]; then
+                    echo " [Step reached maximum limit of ${max_wait}s]" >> "$log_file"
+                    kill -TERM $pid 2>/dev/null || true
+                    sleep 1
+                    kill -9 $pid 2>/dev/null || true
+                    break
+                fi
             fi
             local temp=${spinstr#?}
             printf "[%c]" "$spinstr"
             local spinstr=$temp${spinstr%"$temp"}
-            sleep 0.2
-            elapsed=$((elapsed + 1))
+            sleep 0.15
             printf "\b\b\b"
         done
     else
         while kill -0 $pid 2>/dev/null; do
-            if [ $elapsed -ge $max_wait ]; then
-                echo " [Step exceeded timeout limit of ${max_wait}s]" >> "$log_file"
-                kill -TERM $pid 2>/dev/null || true
-                sleep 1
-                kill -9 $pid 2>/dev/null || true
-                break
+            local cur_time=$(date +%s 2>/dev/null || echo 0)
+            if [ "$start_time" -gt 0 ] && [ "$cur_time" -gt 0 ]; then
+                local elapsed=$((cur_time - start_time))
+                if [ $elapsed -ge $max_wait ]; then
+                    echo " [Step reached maximum limit of ${max_wait}s]" >> "$log_file"
+                    kill -TERM $pid 2>/dev/null || true
+                    sleep 1
+                    kill -9 $pid 2>/dev/null || true
+                    break
+                fi
             fi
             sleep 1
-            elapsed=$((elapsed + 1))
         done
     fi
     
@@ -144,6 +155,10 @@ execute_step() {
     wait $pid 2>/dev/null || status=$?
     if [ $status -eq 0 ]; then
         printf "\r  ${GREEN}✓${NC} %-44s ${GREEN}[Done]${NC}\n" "$msg"
+    elif [ $is_optional -eq 1 ]; then
+        printf "\r  ${YELLOW}⚠${NC} %-44s ${YELLOW}[Container Fallback]${NC}\n" "$msg"
+        echo -e "  ${YELLOW}Notice: Host Java setup was bypassed. Docker Minecraft servers will use containerized Java.${NC}"
+        return 0
     else
         printf "\r  ${RED}✗${NC} %-44s ${RED}[Fail]${NC}\n" "$msg"
         echo -e "\n${RED}UPDATE FAILED${NC} on step: $msg"
@@ -418,6 +433,8 @@ execute_step "Docker & Compose requirement check" check_and_repair_docker
 
 # 8. Requirement Check & Auto-Repair: Java (OpenJDK for Minecraft runtime)
 check_and_repair_java() {
+    trap 'return 0' TERM INT
+
     # 1. Quick check: Is Java already active in PATH?
     if command -v java > /dev/null 2>&1 && java -version > /dev/null 2>&1; then
         echo "Java runtime already active: $(java -version 2>&1 | head -n 1)"
@@ -453,7 +470,7 @@ check_and_repair_java() {
 
     local TIMEOUT_BIN=""
     if command -v timeout > /dev/null 2>&1; then
-        TIMEOUT_BIN="timeout 40"
+        TIMEOUT_BIN="timeout 90"
     fi
 
     if command -v apt-get > /dev/null 2>&1; then
