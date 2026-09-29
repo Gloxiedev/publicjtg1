@@ -98,6 +98,16 @@ get_compose_cmd() {
     fi
 }
 
+run_root() {
+    if [ "$EUID" -eq 0 ]; then
+        "$@"
+    elif command -v sudo > /dev/null 2>&1; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
 execute_step() {
     local msg="$1"
     shift
@@ -111,14 +121,44 @@ execute_step() {
     "$@" > "$log_file" 2>&1 &
     local pid=$!
     
+    local elapsed=0
+    local max_wait=360
+    case "$msg" in
+        *"Java"*) max_wait=75 ;;
+        *"Requirement"*) max_wait=120 ;;
+        *"PM2"*) max_wait=90 ;;
+        *"Node"*) max_wait=180 ;;
+        *) max_wait=360 ;;
+    esac
+
     if [ -t 1 ]; then
         local spinstr='|/-\\'
         while kill -0 $pid 2>/dev/null; do
+            if [ $elapsed -ge $max_wait ]; then
+                echo " [Step exceeded timeout limit of ${max_wait}s]" >> "$log_file"
+                kill -TERM $pid 2>/dev/null || true
+                sleep 1
+                kill -9 $pid 2>/dev/null || true
+                break
+            fi
             local temp=${spinstr#?}
             printf "[%c]" "$spinstr"
             local spinstr=$temp${spinstr%"$temp"}
-            sleep 0.08
+            sleep 0.2
+            elapsed=$((elapsed + 1))
             printf "\b\b\b"
+        done
+    else
+        while kill -0 $pid 2>/dev/null; do
+            if [ $elapsed -ge $max_wait ]; then
+                echo " [Step exceeded timeout limit of ${max_wait}s]" >> "$log_file"
+                kill -TERM $pid 2>/dev/null || true
+                sleep 1
+                kill -9 $pid 2>/dev/null || true
+                break
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
         done
     fi
     
@@ -149,6 +189,11 @@ execute_step() {
 
 check_system_deps() {
     detect_os
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+    export UCF_FORCE_CONFFOLD=1
+
     local MISSING_DEPS=""
     for cmd in curl git tar; do
         if ! command -v "$cmd" > /dev/null 2>&1; then
@@ -157,14 +202,19 @@ check_system_deps() {
     done
 
     if [ -n "$MISSING_DEPS" ]; then
+        local TIMEOUT_CMD=""
+        if command -v timeout > /dev/null 2>&1; then
+            TIMEOUT_CMD="timeout 60"
+        fi
         if command -v apt-get > /dev/null 2>&1; then
-            sudo apt-get update -y -q > /dev/null 2>&1 || true
-            sudo apt-get install -y $MISSING_DEPS build-essential ca-certificates -q > /dev/null 2>&1 || true
+            local APT_OPTS="-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::http::Timeout=10 -o Acquire::ftp::Timeout=10"
+            $TIMEOUT_CMD run_root apt-get update $APT_OPTS > /dev/null 2>&1 || true
+            $TIMEOUT_CMD run_root apt-get install $APT_OPTS $MISSING_DEPS build-essential ca-certificates > /dev/null 2>&1 || true
         elif command -v yum > /dev/null 2>&1; then
-            sudo yum update -y -q > /dev/null 2>&1 || true
-            sudo yum install -y $MISSING_DEPS make gcc-c++ ca-certificates -q > /dev/null 2>&1 || true
+            $TIMEOUT_CMD run_root yum update -y -q > /dev/null 2>&1 || true
+            $TIMEOUT_CMD run_root yum install -y $MISSING_DEPS make gcc-c++ ca-certificates -q > /dev/null 2>&1 || true
         elif command -v dnf > /dev/null 2>&1; then
-            sudo dnf install -y $MISSING_DEPS make gcc-c++ ca-certificates -q > /dev/null 2>&1 || true
+            $TIMEOUT_CMD run_root dnf install -y $MISSING_DEPS make gcc-c++ ca-certificates -q > /dev/null 2>&1 || true
         fi
     fi
 
@@ -302,24 +352,126 @@ install_node() {
 }
 
 install_java() {
+    # 1. Quick check: Is Java already working in PATH?
+    if command -v java > /dev/null 2>&1 && java -version > /dev/null 2>&1; then
+        echo "Java runtime already active: $(java -version 2>&1 | head -n 1)"
+        return 0
+    fi
+
+    # 2. Check common JVM installation directories
+    for cand in /usr/lib/jvm/java-21-openjdk-*/bin/java \
+                /usr/lib/jvm/java-17-openjdk-*/bin/java \
+                /usr/lib/jvm/default-java/bin/java \
+                /usr/lib/jvm/java-11-openjdk-*/bin/java \
+                /usr/lib/jvm/*-openjdk*/bin/java \
+                /opt/java/bin/java \
+                /opt/jtg-java/bin/java \
+                /usr/local/java/bin/java; do
+        if [ -x "$cand" ]; then
+            echo "Found existing JVM at: $cand"
+            run_root ln -sf "$cand" /usr/local/bin/java 2>/dev/null || true
+            export PATH="/usr/local/bin:$PATH"
+            if command -v java > /dev/null 2>&1 && java -version > /dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done
+
+    echo "Configuring OpenJDK runtime..."
+
+    # Ensure non-interactive environment to prevent debconf / needrestart hangs
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+    export UCF_FORCE_CONFFOLD=1
+
+    local TIMEOUT_BIN=""
+    if command -v timeout > /dev/null 2>&1; then
+        TIMEOUT_BIN="timeout 40"
+    fi
+
+    if command -v apt-get > /dev/null 2>&1; then
+        local APT_OPTS="-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::http::Timeout=10 -o Acquire::ftp::Timeout=10"
+        
+        # Check for active dpkg lock; wait max 5 seconds
+        local wait_lock=0
+        while (fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1) && [ $wait_lock -lt 5 ]; do
+            sleep 1
+            wait_lock=$((wait_lock + 1))
+        done
+
+        # Try fast headless JRE install with individual timeouts
+        $TIMEOUT_BIN run_root apt-get install $APT_OPTS openjdk-21-jre-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN run_root apt-get install $APT_OPTS openjdk-17-jre-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN run_root apt-get install $APT_OPTS default-jre-headless > /dev/null 2>&1 || true
+
+    elif command -v dnf > /dev/null 2>&1; then
+        $TIMEOUT_BIN run_root dnf install -y java-21-openjdk-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN run_root dnf install -y java-17-openjdk-headless > /dev/null 2>&1 || true
+    elif command -v yum > /dev/null 2>&1; then
+        $TIMEOUT_BIN run_root yum install -y java-21-openjdk-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN run_root yum install -y java-17-openjdk-headless > /dev/null 2>&1 || true
+    elif command -v apk > /dev/null 2>&1; then
+        $TIMEOUT_BIN apk add --no-cache openjdk21-jre-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN apk add --no-cache openjdk17-jre-headless > /dev/null 2>&1 || true
+    elif command -v pacman > /dev/null 2>&1; then
+        $TIMEOUT_BIN run_root pacman -Sy --noconfirm jre21-openjdk-headless > /dev/null 2>&1 || \
+        $TIMEOUT_BIN run_root pacman -Sy --noconfirm jre17-openjdk-headless > /dev/null 2>&1 || true
+    fi
+
+    # Check if package manager installed Java successfully
     if command -v java > /dev/null 2>&1 && java -version > /dev/null 2>&1; then
         return 0
     fi
-    echo "Installing Java (OpenJDK) for Minecraft runtime..."
-    if command -v apt-get > /dev/null 2>&1; then
-        sudo apt-get update -y -q > /dev/null 2>&1 || true
-        sudo apt-get install -y -q openjdk-21-jre-headless > /dev/null 2>&1 || \
-        sudo apt-get install -y -q openjdk-17-jre-headless > /dev/null 2>&1 || \
-        sudo apt-get install -y -q default-jre-headless > /dev/null 2>&1 || true
-    elif command -v dnf > /dev/null 2>&1; then
-        sudo dnf install -y java-21-openjdk-headless > /dev/null 2>&1 || sudo dnf install -y java-17-openjdk-headless > /dev/null 2>&1 || true
-    elif command -v yum > /dev/null 2>&1; then
-        sudo yum install -y java-21-openjdk-headless > /dev/null 2>&1 || sudo yum install -y java-17-openjdk-headless > /dev/null 2>&1 || true
-    elif command -v apk > /dev/null 2>&1; then
-        apk add --no-cache openjdk21-jre-headless > /dev/null 2>&1 || apk add --no-cache openjdk17-jre-headless > /dev/null 2>&1 || true
-    elif command -v pacman > /dev/null 2>&1; then
-        sudo pacman -Sy --noconfirm jre21-openjdk-headless > /dev/null 2>&1 || sudo pacman -Sy --noconfirm jre17-openjdk-headless > /dev/null 2>&1 || true
+
+    # Check discovered JVM directories again in case package manager placed it without symlink
+    for cand in /usr/lib/jvm/java-21-openjdk-*/bin/java \
+                /usr/lib/jvm/java-17-openjdk-*/bin/java \
+                /usr/lib/jvm/default-java/bin/java \
+                /usr/lib/jvm/*-openjdk*/bin/java; do
+        if [ -x "$cand" ]; then
+            run_root ln -sf "$cand" /usr/local/bin/java 2>/dev/null || true
+            export PATH="/usr/local/bin:$PATH"
+            if command -v java > /dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    done
+
+    # 3. Direct lightweight headless JRE fallback via Adoptium
+    local ARCH=$(uname -m)
+    local ADOPT_ARCH=""
+    case "$ARCH" in
+        x86_64) ADOPT_ARCH="x64" ;;
+        aarch64|arm64) ADOPT_ARCH="aarch64" ;;
+        *) ADOPT_ARCH="" ;;
+    esac
+
+    if [ -n "$ADOPT_ARCH" ] && command -v curl > /dev/null 2>&1; then
+        echo "Attempting fast binary runtime fetch..."
+        local JRE_URL="https://api.adoptium.net/v3/binary/latest/21/ga/linux/${ADOPT_ARCH}/jre/hotspot/normal/eclipse"
+        curl -fsSL --connect-timeout 8 --max-time 45 "$JRE_URL" -o /tmp/jtg_jre.tar.gz > /dev/null 2>&1 || true
+        if [ -f "/tmp/jtg_jre.tar.gz" ] && [ -s "/tmp/jtg_jre.tar.gz" ]; then
+            run_root mkdir -p /opt/jtg-java
+            run_root tar -xzf /tmp/jtg_jre.tar.gz -C /opt/jtg-java --strip-components=1 > /dev/null 2>&1 || true
+            rm -f /tmp/jtg_jre.tar.gz
+            if [ -x "/opt/jtg-java/bin/java" ]; then
+                run_root ln -sf /opt/jtg-java/bin/java /usr/local/bin/java 2>/dev/null || true
+                export PATH="/usr/local/bin:$PATH"
+                if command -v java > /dev/null 2>&1; then
+                    echo "Java OpenJDK runtime installed successfully."
+                    return 0
+                fi
+            fi
+        fi
+        rm -f /tmp/jtg_jre.tar.gz 2>/dev/null || true
     fi
+
+    # 4. Safe Non-fatal Fallback:
+    # JTG Panel itself runs on Node.js. Dockerized Minecraft instances embed Java automatically in their containers.
+    # Therefore, failure to set up host Java must never freeze or halt the installer.
+    echo "Notice: Host Java setup completed with container fallback."
+    echo "Note: Docker-managed Minecraft servers will run using containerized Java."
     return 0
 }
 
