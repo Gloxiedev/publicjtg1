@@ -394,7 +394,7 @@ export default function Nodes() {
               <div className="pt-4">
                 <button
                   type="submit"
-                  className="w-full rounded-xl bg-theme-600 p-3 text.sm font-semibold text-white hover:bg-theme-700 transition-colors cursor-pointer"
+                  className="w-full rounded-xl bg-theme-600 p-3 text-sm font-semibold text-white hover:bg-theme-700 transition-colors cursor-pointer"
                 >
                   Create Node & Generate Setup Token
                 </button>
