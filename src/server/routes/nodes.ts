@@ -6,7 +6,6 @@ import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = Router();
 
-// Helper to get nodes list safely
 async function getNodesList() {
   const nodes = await readJSON("nodes.json");
   if (nodes && Array.isArray(nodes)) return nodes;
@@ -17,14 +16,9 @@ async function getNodesList() {
 
 async function saveNodesList(nodes: any[]) {
   await writeJSON("nodes.json", nodes);
-  await writeJSON("wings_nodes.json", nodes); // sync backward compat if needed
+  await writeJSON("wings_nodes.json", nodes);
 }
 
-// -------------------------------------------------------------
-// PUBLIC / WINGS ENDPOINTS (Unauthenticated or Token Authenticated)
-// -------------------------------------------------------------
-
-// 1. Wings Installer Script Endpoint
 router.get("/install", (req, res) => {
   const host = req.headers.host || "localhost:6767";
   const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
@@ -71,11 +65,16 @@ if [ -z "\$REG_TOKEN" ]; then
   exit 1
 fi
 
-echo -e "\${CYAN}→ Installing dependencies (curl, docker, systemd)...'\${NC}"
+echo -e "\${CYAN}→ Installing dependencies (curl, nodejs, docker, systemd)...\${NC}"
 if command -v apt-get >/dev/null 2>&1; then
-  sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates docker.io >/dev/null 2>&1 || true
+  sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates nodejs docker.io >/dev/null 2>&1 || true
 elif command -v yum >/dev/null 2>&1; then
-  sudo yum install -y -q curl ca-certificates docker >/dev/null 2>&1 || true
+  sudo yum install -y -q curl ca-certificates nodejs docker >/dev/null 2>&1 || true
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1 || true
+  sudo apt-get install -y -qq nodejs >/dev/null 2>&1 || true
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -234,7 +233,6 @@ echo -e "\${GREEN}===========================================\${NC}"
   res.send(script);
 });
 
-// 2. Wings Registration Endpoint (One-time token exchange)
 router.post("/register", async (req, res) => {
   try {
     const { registrationToken } = req.body;
@@ -280,7 +278,6 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// 3. Wings Heartbeat Endpoint
 router.post("/heartbeat", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -313,15 +310,9 @@ router.post("/heartbeat", async (req, res) => {
 });
 
 
-// -------------------------------------------------------------
-// ADMIN ENDPOINTS (Requires Auth & Admin/Owner Role)
-// -------------------------------------------------------------
-
-// List Nodes
 router.get("/", requireAuth, async (req, res) => {
   try {
     const nodes = await getNodesList();
-    // Update offline status for nodes missing heartbeat > 90 seconds
     const now = Date.now();
     const updatedNodes = nodes.map((n: any) => {
       if (n.lastHeartbeat) {
@@ -346,7 +337,6 @@ router.get("/", requireAuth, async (req, res) => {
   }
 });
 
-// Create Node
 router.post("/", requireAuth, requireAdmin, async (req, res) => {
   try {
     const {
@@ -374,7 +364,7 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
     const id = uuidv4();
     const nodeUuid = uuidv4();
     const regToken = "jtg_reg_" + crypto.randomBytes(20).toString("hex");
-    const regExpires = new Date(Date.now() + 24 * 3600 * 1000).toISOString(); // 24 hours
+    const regExpires = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
 
     const newNode = {
       id,
@@ -423,7 +413,6 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Get Specific Node Details
 router.get("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -438,7 +427,6 @@ router.get("/:id", requireAuth, async (req, res) => {
   }
 });
 
-// Node Configuration & Installation Command Info
 router.get("/:id/configuration", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -474,7 +462,6 @@ router.get("/:id/configuration", requireAuth, requireAdmin, async (req, res) => 
   }
 });
 
-// Regenerate Registration Token
 router.post("/:id/regenerate-token", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -500,7 +487,6 @@ router.post("/:id/regenerate-token", requireAuth, requireAdmin, async (req, res)
   }
 });
 
-// Revoke Node Credentials
 router.post("/:id/revoke", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -520,7 +506,6 @@ router.post("/:id/revoke", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Delete Node
 router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
@@ -531,7 +516,6 @@ router.delete("/:id", requireAuth, requireAdmin, async (req, res) => {
       return res.status(404).json({ error: "Node not found" });
     }
 
-    // Check if any server is assigned to this node
     const servers = (await readJSON("servers.json")) || [];
     const assignedServers = servers.filter((s: any) => s.nodeId === id);
 
