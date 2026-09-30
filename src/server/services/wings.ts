@@ -7,23 +7,27 @@ import fs from "fs-extra";
 import path from "path";
 
 async function getWingsNode(nodeId: string) {
-  const nodes = await readJSON("wings_nodes.json") || [];
+  const nodes = (await readJSON("nodes.json")) || (await readJSON("wings_nodes.json")) || [];
   return nodes.find((n: any) => n.id === nodeId);
 }
 
 function getWingsClient(node: any) {
   let url = node.apiUrl;
   if (!url) {
-    const protocol = node.ssl ? "https" : "http";
-    url = `${protocol}://${node.hostname}:${node.apiPort || 8080}`;
+    const protocol = node.protocol || (node.ssl ? "https" : "http");
+    const host = node.fqdn || node.hostname || node.publicIpV4 || "localhost";
+    const port = node.wingsPort || node.apiPort || 8080;
+    url = `${protocol}://${host}:${port}`;
   }
+  const token = node.apiSecret || node.token || "";
   return axios.create({
     baseURL: url,
     headers: {
-      "Authorization": `Bearer ${node.token}`,
+      "Authorization": `Bearer ${token}`,
       "Accept": "application/json",
       "Content-Type": "application/json"
-    }
+    },
+    timeout: 10000
   });
 }
 

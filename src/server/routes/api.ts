@@ -13,6 +13,7 @@ router.use("/servers", serverRoutes);
 router.use("/system", systemRoutes);
 router.use("/admin/api-keys", apiKeyRoutes);
 router.use("/nodes", nodeRoutes);
+router.use("/wings", nodeRoutes);
 
 router.get("/health", (req, res) => {
   res.json({

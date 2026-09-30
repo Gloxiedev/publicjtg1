@@ -161,11 +161,25 @@ export const createServer = async (req: Request, res: Response) => {
   const settings = await readJSON("settings.json") || {};
   const isDevPanel = (process.env.PANEL_TYPE === "dev" || process.env.PORT === "3000") && !process.env.FORCE_MAIN_PANEL;
   if (!isDevPanel) {
-    // If running on Main Panel, enforce the locked default runtime configured at installation
-    runtimeType = settings.defaultRuntime || "docker";
+    runtimeType = settings.defaultRuntime || "wings";
   }
   if (!name || !ram || !port) {
     res.status(400).json({ error: "Missing required fields (name, ram, port)" });
+    return;
+  }
+
+  const nodes = (await readJSON("nodes.json")) || (await readJSON("wings_nodes.json")) || [];
+  if (!nodeId && nodes.length > 0) {
+    nodeId = nodes[0].id;
+  }
+  if (!nodeId) {
+    res.status(400).json({ error: "No Wings node available. Please create a Node first." });
+    return;
+  }
+
+  const selectedNode = nodes.find((n: any) => n.id === nodeId);
+  if (!selectedNode) {
+    res.status(400).json({ error: "Selected Node does not exist." });
     return;
   }
 
@@ -173,14 +187,14 @@ export const createServer = async (req: Request, res: Response) => {
   const serverData = {
     id,
     name,
-    owner: owner || ownerId || user.id, // Support assigning owner at creation
+    owner: owner || ownerId || user.id,
     ram,
     cpu: cpu || 100,
     disk: disk || 10,
     port,
     ipAlias: ipAlias || "",
-    runtimeType: runtimeType || "docker",
-    nodeId: nodeId || "local",
+    runtimeType: runtimeType || "wings",
+    nodeId: nodeId,
     type: type || "PAPER",
     version: version || "26.3",
     javaVersion: javaVersion || "",
@@ -192,8 +206,8 @@ export const createServer = async (req: Request, res: Response) => {
 
   const servers = await readJSON("servers.json") || [];
   
-  if (servers.find((s: any) => s.port == port)) {
-    res.status(400).json({ error: "Port is already in use by another server." });
+  if (servers.find((s: any) => s.nodeId === nodeId && s.port == port)) {
+    res.status(400).json({ error: "Port is already in use by another server on this node." });
     return;
   }
 
