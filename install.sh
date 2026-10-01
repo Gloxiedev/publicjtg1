@@ -2,6 +2,12 @@
 # =========================================================
 # JTG Panel - Automated Installation & Management Script
 # =========================================================
+#
+# One-line install (nothing needs to be cloned first):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh)
+#
+# Fully unattended, with your own owner account:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) --yes --owner-user admin --owner-pass 'your-password'
 
 # Ensure running in bash
 if [ -z "$BASH_VERSION" ]; then
@@ -18,15 +24,67 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-if [ -f "package.json" ]; then
-    WORK_DIR="."
-elif [ -d "Jtg" ] && [ -f "Jtg/package.json" ]; then
-    WORK_DIR="Jtg"
+REPO_URL="https://github.com/Gloxiedev/publicjtg1.git"
+REPO_DIR_NAME="jtgsecret"
+INSTALL_ROOT="${JTG_INSTALL_ROOT:-$HOME/jtgsecret}"
+
+UNATTENDED=0
+RUN_CHOICE=""
+OWNER_USER_ARG=""
+OWNER_PASS_ARG=""
+
+usage() {
+    echo "Usage: install.sh [options]"
+    echo ""
+    echo "  --yes                  Install unattended, no prompts."
+    echo "  --mode <1|2>           1) Node.js via PM2 (recommended)  2) Pure local Node.js"
+    echo "  --owner-user <name>    Owner account username"
+    echo "  --owner-pass <pass>    Owner account password (min 6 characters)"
+    echo "  --help                 Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh)"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) --yes"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) main"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --yes|-y) UNATTENDED=1; shift ;;
+        --mode) RUN_CHOICE="$2"; shift 2 ;;
+        --owner-user) OWNER_USER_ARG="$2"; shift 2 ;;
+        --owner-pass) OWNER_PASS_ARG="$2"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+if [ -n "$OWNER_USER_ARG" ]; then export JTG_OWNER_USER="$OWNER_USER_ARG"; fi
+if [ -n "$OWNER_PASS_ARG" ]; then export JTG_OWNER_PASS="$OWNER_PASS_ARG"; fi
+if [ "$UNATTENDED" = "1" ] && [ -z "$RUN_CHOICE" ]; then RUN_CHOICE="1"; fi
+
+# When piped from a URL there is no local checkout, so clone the repository.
+# An existing checkout is always preferred so local edits keep working.
+if [ -f "package.json" ] && [ -f "scripts/createuser.ts" ]; then
+    WORK_DIR="$(pwd)"
+elif [ -d "$REPO_DIR_NAME" ] && [ -f "$REPO_DIR_NAME/package.json" ]; then
+    WORK_DIR="$REPO_DIR_NAME"
 else
-    git clone https://github.com/JishnuTheGamer/Jtg Jtg 2>/dev/null || true
-    WORK_DIR="Jtg"
+    echo "Fetching JTG Panel from $REPO_URL ..."
+    git clone --depth 1 "$REPO_URL" "$INSTALL_ROOT" 2>&1 | tail -2 || {
+        echo -e "${RED}Failed to clone $REPO_URL${NC}"
+        exit 1
+    }
+    WORK_DIR="$INSTALL_ROOT"
 fi
-cd "$WORK_DIR" || true
+cd "$WORK_DIR" || {
+    echo -e "${RED}Failed to enter $WORK_DIR${NC}"
+    exit 1
+}
+if [ ! -f "package.json" ]; then
+    echo -e "${RED}package.json not found in $(pwd)${NC}"
+    exit 1
+fi
 
 detect_os() {
     OS_TYPE="Unknown"
@@ -905,8 +963,14 @@ install_panel() {
             OWNER_USER="$JTG_OWNER_USER"
             OWNER_PASS="$JTG_OWNER_PASS"
         elif [ ! -t 0 ]; then
+            # Unattended without explicit credentials: generate a strong random
+            # password and print it, rather than silently shipping a known default.
             OWNER_USER="owner"
-            OWNER_PASS="owner12345"
+            OWNER_PASS=$(head -c 24 /dev/urandom | base64 2>/dev/null | tr -d '/+=' | head -c 20)
+            if [ ${#OWNER_PASS} -lt 10 ]; then
+                OWNER_PASS="jtg$(date +%s)"
+            fi
+            GENERATED_PASS="$OWNER_PASS"
         else
             while true; do
                 read -p "║ Username: " OWNER_USER
@@ -944,8 +1008,22 @@ install_panel() {
             cp .env.example .env
         else
             echo "PORT=6767" > .env
-            echo "JWT_SECRET=$(head -c 32 /dev/urandom | base64 2>/dev/null || openssl rand -base64 32)" >> .env
+            echo "ENABLE_DOCKER=\"true\"" >> .env
+            echo "DOCKER_SOCKET_PATH=\"/var/run/docker.sock\"" >> .env
         fi
+        # Never ship the placeholder secret from .env.example: anyone could
+        # forge session tokens with it. Always generate a real one.
+        NEW_JWT=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -d '\n' || openssl rand -base64 32)
+        if [ -z "$NEW_JWT" ]; then
+            NEW_JWT=$(openssl rand -hex 32)
+        fi
+        if grep -q 'JWT_SECRET=' .env; then
+            sed -i.bak "s|^JWT_SECRET=.*|JWT_SECRET=\"${NEW_JWT}\"|" .env
+            rm -f .env.bak
+        else
+            echo "JWT_SECRET=\"${NEW_JWT}\"" >> .env
+        fi
+        echo -e "${GREEN}[INFO]${NC} Generated a unique JWT secret in .env"
     fi
 
     print_banner
@@ -983,6 +1061,10 @@ install_panel() {
         log_success "JTG Main Panel installation is complete and verified!"
         echo -e "${GREEN}✓ You can now open http://${IP}:6767 and log in with '${OWNER_USER}'.${NC}
 "
+        if [ -n "$GENERATED_PASS" ]; then
+            echo -e "${YELLOW}  Generated owner password: ${BOLD}${GENERATED_PASS}${NC}"
+            echo -e "${YELLOW}  Store it now and change it after your first login.${NC}\n"
+        fi
     else
         log_success "JTG Developer Panel installation is complete and verified!"
         echo -e "${GREEN}✓ Developer Panel running on http://${IP}:3000.${NC}
@@ -1052,6 +1134,9 @@ if [ "$1" = "main" ]; then
 elif [ "$1" = "dev" ]; then
     install_panel "dev"
     exit 0
+elif [ "$UNATTENDED" = "1" ]; then
+    install_panel "main"
+    exit $?
 fi
 
 while true; do
