@@ -29,9 +29,8 @@ if (!fs.existsSync(path.join(DATA_DIR, "users.json"))) fs.writeFileSync(path.joi
 if (!fs.existsSync(path.join(DATA_DIR, "servers.json"))) fs.writeFileSync(path.join(DATA_DIR, "servers.json"), "[]");
 if (!fs.existsSync(path.join(DATA_DIR, "settings.json"))) fs.writeFileSync(path.join(DATA_DIR, "settings.json"), "{}");
 
-import { attachContainerSocket, getContainerLogs } from "./src/server/services/docker.js";
+import { getServerRuntimeLogs, attachServerRuntimeSocket } from "./src/server/services/runtime.js";
 import { panelEvents } from "./src/server/events.js";
-import { getLocalServerLogs } from "./src/server/services/local.js";
 
 panelEvents.on("log", (serverId: string, logData: string) => {
   io.to(`server_${serverId}`).emit("log", logData);
@@ -52,25 +51,19 @@ io.use((socket, next) => {
 io.on("connection", (socket) => {
   socket.on("joinServer", async (serverId) => {
     socket.join(`server_${serverId}`);
-    
-    // Stream initial logs whether local runtime or docker
+
     try {
       const serversJSON = await fs.readFile(path.join(DATA_DIR, "servers.json"), "utf8");
       const servers = JSON.parse(serversJSON);
       const server = Array.isArray(servers) ? servers.find((s: any) => s.id === serverId) : null;
-      
-      // Check local logs first
-      const localLogs = await getLocalServerLogs(serverId);
-      if (localLogs) {
-        socket.emit("log", localLogs.trim() + "\n");
-      }
+      if (!server) return;
 
-      if (server && server.containerId && !String(server.containerId).startsWith("local-")) {
-        const logs = await getContainerLogs(server.containerId);
-        if (logs) {
-           socket.emit("log", logs.trim() + "\n");
-        }
-        await attachContainerSocket(server.containerId, serverId);
+      const logs = await getServerRuntimeLogs(server);
+      if (logs) {
+        socket.emit("log", String(logs).trim() + "\n");
+      }
+      if (server.status === "online") {
+        await attachServerRuntimeSocket(server, serverId);
       }
     } catch (e) {
       console.error("Error fetching logs for server", serverId, e);

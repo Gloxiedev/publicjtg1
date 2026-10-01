@@ -56,8 +56,7 @@ router.get("/:id/backups/:filename", downloadBackup);
 router.delete("/:id/backups/:filename", deleteBackup);
 router.post("/:id/backups/:filename/restore", restoreBackup);
 
-import { getContainerLogs } from "../services/docker.js";
-import { getLocalServerLogs } from "../services/local.js";
+import { getServerRuntimeLogs } from "../services/runtime.js";
 
 router.get("/:id/logs", async (req, res) => {
   try {
@@ -67,19 +66,13 @@ router.get("/:id/logs", async (req, res) => {
     const server = servers.find((s: any) => s.id === id);
     if (!server) return res.status(404).json({ error: "Server not found" });
 
-    let logs = "";
-    const localLogs = await getLocalServerLogs(id);
-    if (localLogs) {
-      logs += localLogs.trim() + "\n";
+    const user = (req as any).user;
+    if (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id) {
+      return res.status(403).json({ error: "Forbidden" });
     }
 
-    if (server.containerId && !String(server.containerId).startsWith("local-")) {
-      const dockerLogs = await getContainerLogs(server.containerId);
-      if (dockerLogs) {
-        logs += dockerLogs.trim() + "\n";
-      }
-    }
-    res.json({ logs });
+    const logs = await getServerRuntimeLogs(server);
+    res.json({ logs: typeof logs === "string" ? logs.trim() : "" });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

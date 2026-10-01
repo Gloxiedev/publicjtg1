@@ -3,6 +3,8 @@ import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { readJSON, writeJSON } from "../services/db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
+import { getWingsDaemonSource } from "../services/wingsArtifact.js";
+import { buildWingsInstallScript } from "../services/wingsInstallScript.js";
 
 const router = Router();
 
@@ -19,218 +21,57 @@ async function saveNodesList(nodes: any[]) {
   await writeJSON("wings_nodes.json", nodes);
 }
 
-router.get("/install", (req, res) => {
-  const host = req.headers.host || "localhost:6767";
-  const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
-  const panelUrl = `${protocol}://${host}`;
+const DEFAULT_OFFLINE_THRESHOLD = 90000;
 
-  const script = `#!/bin/bash
-set -e
-
-RED='\\033[0;31m'
-GREEN='\\033[0;32m'
-YELLOW='\\033[1;33m'
-CYAN='\\033[0;36m'
-NC='\\033[0m'
-
-echo -e "\${CYAN}===========================================\${NC}"
-echo -e "\${CYAN}       JTG Panel Wings Node Installer      \${NC}"
-echo -e "\${CYAN}===========================================\${NC}"
-
-# Detect OS
-OS=\$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=\$(uname -m)
-
-if [ "\$OS" != "linux" ]; then
-  echo -e "\${RED}Error: Wings installer only supports Linux OS.\${NC}"
-  exit 1
-fi
-
-case "\$ARCH" in
-  x86_64) WINGS_ARCH="amd64" ;;
-  aarch64|arm64) WINGS_ARCH="arm64" ;;
-  *) echo -e "\${RED}Unsupported architecture: \$ARCH\${NC}"; exit 1 ;;
-esac
-
-PANEL_URL="${panelUrl}"
-REG_TOKEN="\$1"
-
-if [ -z "\$REG_TOKEN" ]; then
-  echo -ne "\${YELLOW}Enter Node Registration Token: \${NC}"
-  read REG_TOKEN
-fi
-
-if [ -z "\$REG_TOKEN" ]; then
-  echo -e "\${RED}Registration token is required.\${NC}"
-  exit 1
-fi
-
-echo -e "\${CYAN}→ Installing dependencies (curl, nodejs, docker, systemd)...\${NC}"
-if command -v apt-get >/dev/null 2>&1; then
-  sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates nodejs docker.io >/dev/null 2>&1 || true
-elif command -v yum >/dev/null 2>&1; then
-  sudo yum install -y -q curl ca-certificates nodejs docker >/dev/null 2>&1 || true
-fi
-
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null 2>&1 || true
-  sudo apt-get install -y -qq nodejs >/dev/null 2>&1 || true
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  sudo systemctl enable --now docker >/dev/null 2>&1 || true
-fi
-
-echo -e "\${CYAN}→ Registering node with JTG Panel at \${PANEL_URL}...\${NC}"
-RESPONSE=\$(curl -s -X POST "\${PANEL_URL}/api/wings/register" \\
-  -H "Content-Type: application/json" \\
-  -d "{\\"registrationToken\\": \\"\${REG_TOKEN}\\"}")
-
-SUCCESS=\$(echo "\$RESPONSE" | grep -o '"success":true' || true)
-
-if [ -z "\$SUCCESS" ]; then
-  echo -e "\${RED}Registration failed!\${NC}"
-  echo -e "\${RED}Server response: \$RESPONSE\${NC}"
-  exit 1
-fi
-
-NODE_ID=\$(echo "\$RESPONSE" | grep -o '"nodeId":"[^"]*' | cut -d'"' -f4)
-NODE_UUID=\$(echo "\$RESPONSE" | grep -o '"uuid":"[^"]*' | cut -d'"' -f4)
-API_SECRET=\$(echo "\$RESPONSE" | grep -o '"apiSecret":"[^"]*' | cut -d'"' -f4)
-WINGS_PORT=\$(echo "\$RESPONSE" | grep -o '"wingsPort":[^,}]*' | cut -d':' -f2 | tr -d ' ')
-
-if [ -z "\$WINGS_PORT" ]; then WINGS_PORT=8080; fi
-
-echo -e "\${GREEN}✓ Node successfully registered! Node ID: \${NODE_ID}\${NC}"
-
-echo -e "\${CYAN}→ Setting up Wings daemon environment...\${NC}"
-sudo mkdir -p /etc/jtg-wings /var/log/jtg-wings /var/lib/jtg-wings
-
-sudo cat <<EOF | sudo tee /etc/jtg-wings/config.yml >/dev/null
-debug: false
-panel_url: "\${PANEL_URL}"
-node_id: "\${NODE_ID}"
-uuid: "\${NODE_UUID}"
-api_secret: "\${API_SECRET}"
-port: \${WINGS_PORT}
-docker:
-  socket: "/var/run/docker.sock"
-EOF
-
-sudo chmod 600 /etc/jtg-wings/config.yml
-
-echo -e "\${CYAN}→ Creating JTG Wings service...\${NC}"
-sudo cat <<EOF | sudo tee /etc/systemd/system/jtg-wings.service >/dev/null
-[Unit]
-Description=JTG Panel Wings Node Daemon
-After=docker.service
-Requires=docker.service
-
-[Service]
-User=root
-WorkingDirectory=/etc/jtg-wings
-ExecStart=/usr/bin/env node -e "
-const http = require('http');
-const https = require('https');
-const fs = require('fs');
-const { exec, execSync } = require('child_process');
-
-let config;
-try {
-  const yaml = fs.readFileSync('/etc/jtg-wings/config.yml', 'utf8');
-  config = {};
-  yaml.split('\\n').forEach(line => {
-    const parts = line.split(':');
-    if (parts.length >= 2) {
-      const key = parts[0].trim();
-      const val = parts.slice(1).join(':').trim().replace(/^\\\"|\\\"$/g, '');
-      config[key] = val;
+/**
+ * A node is only ONLINE while heartbeats keep arriving. A stale stored status is
+ * never trusted: an expired heartbeat always downgrades the node so the panel can
+ * never report a dead daemon as online.
+ */
+function withComputedStatus(node: any, now = Date.now()): any {
+  const threshold = Number(node.offlineThreshold) || DEFAULT_OFFLINE_THRESHOLD;
+  if (node.lastHeartbeat) {
+    const diff = now - new Date(node.lastHeartbeat).getTime();
+    if (diff > threshold && node.status === "online") {
+      return { ...node, status: "offline" };
     }
-  });
-} catch(e) {
-  console.error('Failed to read config:', e);
-  process.exit(1);
+    return node;
+  }
+  if (node.status === "online") {
+    return { ...node, status: node.apiSecret ? "offline" : "installing" };
+  }
+  return node;
 }
 
-const PORT = parseInt(config.port) || 8080;
-const PANEL_URL = config.panel_url;
-const API_SECRET = config.api_secret;
-const NODE_ID = config.node_id;
+function stripSecrets(node: any): any {
+  const { apiSecret, token, registrationToken, registrationTokenExpires, ...safe } = node;
+  return safe;
+}
 
-console.log('JTG Wings Daemon starting on port ' + PORT);
-
-// Heartbeat interval
-setInterval(() => {
+router.get("/daemon.js", async (_req, res) => {
   try {
-    const mem = process.memoryUsage();
-    const payload = JSON.stringify({
-      nodeId: NODE_ID,
-      apiSecret: API_SECRET,
-      version: '3.0.0',
-      uptime: Math.floor(process.uptime()),
-      cpu: 5,
-      memory: { total: 16384, free: 8192 },
-      disk: { total: 100000, free: 80000 }
-    });
-    
-    const client = PANEL_URL.startsWith('https') ? https : http;
-    const req = client.request(PANEL_URL + '/api/wings/heartbeat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + API_SECRET
-      }
-    });
-    req.on('error', () => {});
-    req.write(payload);
-    req.end();
-  } catch(e) {}
-}, 15000);
-
-const server = http.createServer((req, res) => {
-  const auth = req.headers['authorization'];
-  if (!auth || auth !== 'Bearer ' + API_SECRET) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: 'Unauthorized Wings Request' }));
+    const { content } = await getWingsDaemonSource();
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(content);
+  } catch (err: any) {
+    res.status(500).send(`# failed to load wings daemon: ${err.message}\n`);
   }
-
-  if (req.method === 'GET' && req.url === '/api/system') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'online', version: '3.0.0', architecture: process.arch }));
-  }
-
-  let body = '';
-  req.on('data', chunk => body += chunk);
-  req.on('end', () => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'success' }));
-  });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('Wings listening on 0.0.0.0:' + PORT);
-});
-"
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-if command -v systemctl >/dev/null 2>&1; then
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now jtg-wings || true
-fi
-
-echo -e "\${GREEN}===========================================\${NC}"
-echo -e "\${GREEN} JTG Wings Node successfully configured!   \${NC}"
-echo -e "\${GREEN} Node status: ONLINE                       \${NC}"
-echo -e "\${GREEN}===========================================\${NC}"
-`;
-
-  res.setHeader("Content-Type", "text/plain");
-  res.send(script);
+router.get("/install", async (req, res) => {
+  try {
+    const host = req.headers.host || "localhost:6767";
+    const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
+    const panelUrl = `${protocol}://${host}`;
+    const script = await buildWingsInstallScript({ panelUrl });
+    res.setHeader("Content-Type", "text/x-shellscript; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(script);
+  } catch (err: any) {
+    console.error("Failed to build wings install script:", err);
+    res.status(500).send(`#!/bin/bash\necho "panel error: ${err.message}" >&2\nexit 1\n`);
+  }
 });
 
 router.post("/register", async (req, res) => {
@@ -253,15 +94,34 @@ router.post("/register", async (req, res) => {
 
     const node = nodes[nodeIndex];
     const apiSecret = "jtg_ws_" + crypto.randomBytes(24).toString("hex");
+    const wingsPort = node.wingsPort || node.apiPort || 8080;
+    const protocol = node.protocol || (node.ssl ? "https" : "http");
+    const allocations = Array.isArray(node.allocations) ? node.allocations : [];
 
-    // Invalidate single-use registration token and assign API Secret
     nodes[nodeIndex].registrationToken = null;
     nodes[nodeIndex].registrationTokenExpires = null;
     nodes[nodeIndex].apiSecret = apiSecret;
-    nodes[nodeIndex].status = "online";
-    nodes[nodeIndex].lastHeartbeat = new Date().toISOString();
+    nodes[nodeIndex].registeredAt = new Date().toISOString();
+    nodes[nodeIndex].status = "installing";
+    nodes[nodeIndex].lastHeartbeat = null;
+    nodes[nodeIndex].instanceId = null;
 
     await saveNodesList(nodes);
+
+    const nodeConfigYaml = [
+      `bind_address: "0.0.0.0"`,
+      `heartbeat_interval: ${node.heartbeatInterval || 15000}`,
+      `offline_threshold: ${node.offlineThreshold || 90000}`,
+      `runtime_backend: "${node.runtimeBackend || "docker"}"`,
+      `server_memory: ${node.memory || 1024}`,
+      `default_image: "${node.defaultImage || ""}"`,
+      `default_invocation: ${node.defaultInvocation ? JSON.stringify(String(node.defaultInvocation)) : '""'}`,
+      `tls_cert: "${node.tlsCert || ""}"`,
+      `tls_key: "${node.tlsKey || ""}"`,
+      `allocations: '${JSON.stringify(
+        allocations.map((a: any) => ({ id: a.id, ip: a.ip, port: Number(a.port) }))
+      )}'`,
+    ].join("\n");
 
     return res.json({
       success: true,
@@ -269,8 +129,10 @@ router.post("/register", async (req, res) => {
       uuid: node.uuid || node.id,
       name: node.name,
       apiSecret: apiSecret,
-      wingsPort: node.wingsPort || node.apiPort || 8080,
-      protocol: node.protocol || (node.ssl ? "https" : "http")
+      wingsPort,
+      protocol,
+      allocations,
+      nodeConfigYaml
     });
   } catch (err: any) {
     console.error("Error registering Wings node:", err);
@@ -282,7 +144,7 @@ router.post("/heartbeat", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
-    const { nodeId, apiSecret, version, cpu, memory, disk, uptime } = req.body;
+    const { nodeId, apiSecret, version, cpu, memory, disk, uptime, instanceId, systems, resources } = req.body;
 
     const secret = bearerToken || apiSecret;
     if (!secret || !nodeId) {
@@ -299,7 +161,16 @@ router.post("/heartbeat", async (req, res) => {
     nodes[nodeIndex].status = "online";
     nodes[nodeIndex].lastHeartbeat = new Date().toISOString();
     if (version) nodes[nodeIndex].wingsVersion = version;
-    if (cpu !== undefined) nodes[nodeIndex].stats = { cpu, memory, disk, uptime };
+    if (instanceId) {
+      const previous = nodes[nodeIndex].instanceId || null;
+      nodes[nodeIndex].instanceId = instanceId;
+      if (previous && previous !== instanceId) {
+        console.warn(`[wings] node ${nodes[nodeIndex].name} (${nodeId}) was restarted with a new daemon instance`);
+      }
+    }
+    if (cpu !== undefined) {
+      nodes[nodeIndex].stats = { cpu, memory, disk, uptime, systems, resources };
+    }
 
     await saveNodesList(nodes);
 
@@ -313,25 +184,7 @@ router.post("/heartbeat", async (req, res) => {
 router.get("/", requireAuth, async (req, res) => {
   try {
     const nodes = await getNodesList();
-    const now = Date.now();
-    const updatedNodes = nodes.map((n: any) => {
-      if (n.lastHeartbeat) {
-        const diff = now - new Date(n.lastHeartbeat).getTime();
-        if (diff > 90000 && n.status === "online") {
-          return { ...n, status: "offline" };
-        }
-      } else if (!n.status) {
-        return { ...n, status: "installing" };
-      }
-      return n;
-    });
-
-    const safeNodes = updatedNodes.map((n: any) => {
-      const { apiSecret, token, registrationToken, ...safe } = n;
-      return safe;
-    });
-
-    res.json(safeNodes);
+    res.json(nodes.map((n: any) => stripSecrets(withComputedStatus(n))));
   } catch (err: any) {
     res.status(500).json({ error: "Failed to load nodes" });
   }
@@ -354,17 +207,63 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
       memory,
       disk,
       cpuLimit,
-      allocations
+      allocations,
+      runtimeBackend,
+      defaultImage,
+      defaultInvocation,
+      heartbeatInterval,
+      offlineThreshold,
+      tlsCert,
+      tlsKey
     } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: "Node name is required" });
     }
 
+    const resolvedPort = Number(wingsPort || apiPort || 8080);
+    if (!Number.isInteger(resolvedPort) || resolvedPort < 1 || resolvedPort > 65535) {
+      return res.status(400).json({ error: "Wings port must be a valid TCP port (1-65535)" });
+    }
+
+    const resolvedProtocol = protocol || (ssl ? "https" : "http");
+    if (!["http", "https"].includes(resolvedProtocol)) {
+      return res.status(400).json({ error: "Protocol must be http or https" });
+    }
+
+    if (runtimeBackend && !["docker", "process"].includes(runtimeBackend)) {
+      return res.status(400).json({ error: "runtimeBackend must be docker or process" });
+    }
+
     const id = uuidv4();
     const nodeUuid = uuidv4();
     const regToken = "jtg_reg_" + crypto.randomBytes(20).toString("hex");
     const regExpires = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+    const resolvedIpV4 = publicIpV4 || "127.0.0.1";
+    const normalizedAllocations = (Array.isArray(allocations) && allocations.length ? allocations : [
+      { ip: resolvedIpV4, port: 25565 }
+    ]).map((a: any) => ({
+      id: a.id || uuidv4(),
+      ip: a.ip || resolvedIpV4,
+      port: Number(a.port),
+      assigned: false,
+      server: null
+    }));
+
+    for (const alloc of normalizedAllocations) {
+      if (!Number.isInteger(alloc.port) || alloc.port < 1 || alloc.port > 65535) {
+        return res.status(400).json({ error: `Invalid allocation port: ${alloc.port}` });
+      }
+    }
+    const seen = new Set<string>();
+    for (const alloc of normalizedAllocations) {
+      const key = `${alloc.ip}:${alloc.port}`;
+      if (seen.has(key)) {
+        return res.status(400).json({ error: `Duplicate allocation on this node: ${key}` });
+      }
+      seen.add(key);
+    }
 
     const newNode = {
       id,
@@ -373,25 +272,32 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
       description: description || "",
       fqdn: fqdn || hostname || "node.example.com",
       hostname: hostname || fqdn || "node.example.com",
-      publicIpV4: publicIpV4 || "127.0.0.1",
+      publicIpV4: resolvedIpV4,
       publicIpV6: publicIpV6 || "",
-      wingsPort: wingsPort || apiPort || 8080,
-      apiPort: wingsPort || apiPort || 8080,
-      protocol: protocol || (ssl ? "https" : "http"),
+      wingsPort: resolvedPort,
+      apiPort: resolvedPort,
+      protocol: resolvedProtocol,
       ssl: !!ssl,
       location: location || "Default",
       memory: memory || 8192,
       disk: disk || 50000,
       cpuLimit: cpuLimit || 100,
+      runtimeBackend: runtimeBackend || "docker",
+      defaultImage: defaultImage || "",
+      defaultInvocation: defaultInvocation || "",
+      heartbeatInterval: Number(heartbeatInterval) || 15000,
+      offlineThreshold: Number(offlineThreshold) || 90000,
+      tlsCert: tlsCert || "",
+      tlsKey: tlsKey || "",
       status: "installing",
       registrationToken: regToken,
       registrationTokenExpires: regExpires,
       apiSecret: null,
-      allocations: allocations || [
-        { id: uuidv4(), ip: publicIpV4 || "0.0.0.0", port: 25565, assigned: false }
-      ],
+      allocations: normalizedAllocations,
       createdAt: new Date().toISOString(),
+      registeredAt: null,
       lastHeartbeat: null,
+      instanceId: null,
       wingsVersion: null
     };
 
@@ -399,12 +305,10 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
     nodes.push(newNode);
     await saveNodesList(nodes);
 
+    const { apiSecret, registrationToken, ...safeNode } = newNode;
     res.json({
       success: true,
-      node: {
-        ...newNode,
-        apiSecret: undefined
-      },
+      node: safeNode,
       registrationToken: regToken
     });
   } catch (err: any) {
@@ -420,8 +324,7 @@ router.get("/:id", requireAuth, async (req, res) => {
     const node = nodes.find((n: any) => n.id === id);
     if (!node) return res.status(404).json({ error: "Node not found" });
 
-    const { apiSecret, token, ...safeNode } = node;
-    res.json(safeNode);
+    res.json(stripSecrets(withComputedStatus(node)));
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch node" });
   }
@@ -447,6 +350,7 @@ router.get("/:id/configuration", requireAuth, requireAdmin, async (req, res) => 
     }
 
     const installCommand = `curl -fsSL ${panelUrl}/api/wings/install | bash -s -- ${regToken}`;
+    const localTestCommand = `curl -fsSL ${panelUrl}/api/wings/install | bash -s -- ${regToken} --local-test`;
 
     res.json({
       nodeId: node.id,
@@ -455,6 +359,8 @@ router.get("/:id/configuration", requireAuth, requireAdmin, async (req, res) => 
       registrationToken: regToken,
       registrationTokenExpires: node.registrationTokenExpires,
       installCommand,
+      localTestCommand,
+      wingsEndpoint: `${node.protocol || (node.ssl ? "https" : "http")}://${node.fqdn || node.hostname || node.publicIpV4}:${node.wingsPort || node.apiPort || 8080}`,
       hasApiSecret: !!node.apiSecret
     });
   } catch (err: any) {
@@ -496,6 +402,8 @@ router.post("/:id/revoke", requireAuth, requireAdmin, async (req, res) => {
 
     nodes[nodeIndex].apiSecret = null;
     nodes[nodeIndex].registrationToken = null;
+    nodes[nodeIndex].registrationTokenExpires = null;
+    nodes[nodeIndex].instanceId = null;
     nodes[nodeIndex].status = "offline";
 
     await saveNodesList(nodes);

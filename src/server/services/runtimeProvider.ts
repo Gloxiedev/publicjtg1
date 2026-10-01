@@ -1,5 +1,5 @@
 export interface GameServerRuntimeProvider {
-  createServer(server: any): Promise<void>;
+  createServer(server: any): Promise<any>;
   deleteServer(serverId: string): Promise<void>;
   startServer(serverId: string): Promise<void>;
   stopServer(serverId: string): Promise<void>;

@@ -157,7 +157,7 @@ export const createServer = async (req: Request, res: Response) => {
   if (user.role !== "admin" && user.role !== "owner") {
     return res.status(403).json({ error: "Only admins can create servers" });
   }
-  let { name, ram, port, version, theme, cpu, disk, owner, ownerId, ipAlias, type, nodeId, runtimeType, javaVersion } = req.body;
+  let { name, ram, port, version, theme, cpu, disk, owner, ownerId, ipAlias, type, nodeId, runtimeType, javaVersion, ip } = req.body;
   const settings = await readJSON("settings.json") || {};
   const isDevPanel = (process.env.PANEL_TYPE === "dev" || process.env.PORT === "3000") && !process.env.FORCE_MAIN_PANEL;
   if (!isDevPanel) {
@@ -177,13 +177,47 @@ export const createServer = async (req: Request, res: Response) => {
     return;
   }
 
-  const selectedNode = nodes.find((n: any) => n.id === nodeId);
-  if (!selectedNode) {
+  const selectedNodeIndex = nodes.findIndex((n: any) => n.id === nodeId);
+  if (selectedNodeIndex === -1) {
     res.status(400).json({ error: "Selected Node does not exist." });
     return;
   }
+  const selectedNode = nodes[selectedNodeIndex];
 
   const id = crypto.randomUUID();
+  const serverIp = ip || selectedNode.publicIpV4 || "127.0.0.1";
+  const portNumber = Number(port);
+  if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) {
+    res.status(400).json({ error: "Port must be a valid TCP port (1-65535)" });
+    return;
+  }
+
+  if (!Array.isArray(selectedNode.allocations)) {
+    selectedNode.allocations = [];
+  }
+  const nodeAllocations = selectedNode.allocations;
+  let allocation = nodeAllocations.find(
+    (a: any) => Number(a.port) === portNumber && a.ip === serverIp
+  );
+
+  if (allocation && allocation.assigned) {
+    res.status(400).json({
+      error: `Allocation ${serverIp}:${portNumber} is already assigned on this node.`
+    });
+    return;
+  }
+
+  if (allocation) {
+    allocation.assigned = true;
+    allocation.server = id;
+  } else {
+    allocation = { id: crypto.randomUUID(), ip: serverIp, port: portNumber, assigned: true, server: id };
+    nodeAllocations.push(allocation);
+  }
+  nodes[selectedNodeIndex] = selectedNode;
+  await writeJSON("nodes.json", nodes);
+  await writeJSON("wings_nodes.json", nodes);
+
   const serverData = {
     id,
     name,
@@ -191,7 +225,9 @@ export const createServer = async (req: Request, res: Response) => {
     ram,
     cpu: cpu || 100,
     disk: disk || 10,
-    port,
+    port: portNumber,
+    ip: serverIp,
+    allocationId: allocation.id,
     ipAlias: ipAlias || "",
     runtimeType: runtimeType || "wings",
     nodeId: nodeId,
@@ -204,9 +240,9 @@ export const createServer = async (req: Request, res: Response) => {
     containerId: null as string | null,
   };
 
-  const servers = await readJSON("servers.json") || [];
-  
-  if (servers.find((s: any) => s.nodeId === nodeId && s.port == port)) {
+  let servers = await readJSON("servers.json") || [];
+
+  if (servers.find((s: any) => s.nodeId === nodeId && s.port == portNumber)) {
     res.status(400).json({ error: "Port is already in use by another server on this node." });
     return;
   }
@@ -256,13 +292,18 @@ export const createServer = async (req: Request, res: Response) => {
       if (!fs.existsSync(propsPath)) {
         await fs.writeFile(propsPath, `server-port=${port}\nquery.port=${port}\nenable-rcon=true\nrcon.port=${parseInt(port) + 10}\nrcon.password=admin\nmotd=A Minecraft Server on JTG Panel\n`);
       }
-      const jarPath = path.join(serverDir, "server.jar");
-      if (!fs.existsSync(jarPath)) {
-        try {
-          console.log(`[createServer] Downloading initial server.jar for ${name} (${upperType} ${version})...`);
-          await downloadJar(upperType, version || "26.2", jarPath);
-        } catch (dlErr: any) {
-          console.warn("[createServer] Initial jar download deferred to background:", dlErr.message);
+      // Only the panel-local runtime owns files under .data. For Wings nodes the
+      // server files live on the node's own filesystem, so downloading a jar here
+      // would only waste bandwidth and panel disk.
+      if (!serverData.runtimeType || serverData.runtimeType === "local") {
+        const jarPath = path.join(serverDir, "server.jar");
+        if (!fs.existsSync(jarPath)) {
+          try {
+            console.log(`[createServer] Downloading initial server.jar for ${name} (${upperType} ${version})...`);
+            await downloadJar(upperType, version || "26.2", jarPath);
+          } catch (dlErr: any) {
+            console.warn("[createServer] Initial jar download deferred to background:", dlErr.message);
+          }
         }
       }
     }
@@ -272,17 +313,37 @@ export const createServer = async (req: Request, res: Response) => {
 
   try {
     const containerId = await createServerRuntime(serverData);
-    serverData.containerId = containerId;
+    serverData.containerId = containerId == null ? null : String(containerId);
     serverData.status = "offline";
     await writeJSON("servers.json", Object.assign(servers, servers.map((s:any)=>s.id===id?serverData:s)));
     await createSftpUser(id).catch(e => console.error("SFTP user creation failed:", e));
     res.json(serverData);
   } catch (err: any) {
     console.error(err);
+    await releaseNodeAllocation(nodeId, serverIp, portNumber, id);
+    servers = (await readJSON("servers.json") || []).filter((s: any) => s.id !== id);
+    await writeJSON("servers.json", servers);
     res.status(500).json({ error: err.message });
   }
   } finally {
     isCreatingServer = false;
+  }
+};
+
+const releaseNodeAllocation = async (nodeId: string, ip: string, port: number, serverId: string) => {
+  try {
+    const nodes = (await readJSON("nodes.json")) || (await readJSON("wings_nodes.json")) || [];
+    const node = nodes.find((n: any) => n.id === nodeId);
+    if (!node || !Array.isArray(node.allocations)) return;
+    const alloc = node.allocations.find((a: any) => a.server === serverId || (a.ip === ip && Number(a.port) === Number(port)));
+    if (alloc) {
+      alloc.assigned = false;
+      alloc.server = null;
+      await writeJSON("nodes.json", nodes);
+      await writeJSON("wings_nodes.json", nodes);
+    }
+  } catch (e) {
+    console.error("Failed to release node allocation:", e);
   }
 };
 
@@ -350,7 +411,11 @@ export const deleteServer = async (req: Request, res: Response) => {
     
     servers = servers.filter((s: any) => s.id !== id);
     await writeJSON("servers.json", servers);
-    
+
+    if (server.nodeId) {
+      await releaseNodeAllocation(server.nodeId, server.ip, server.port, id);
+    }
+
     // Remove files
     const serverDir = path.join(process.cwd(), ".data", "servers", id);
     try {
@@ -413,9 +478,13 @@ export const startServer = async (req: Request, res: Response) => {
       await writeJSON("servers.json", servers);
     }
 
-    // Ensure server.jar is present for Minecraft servers before boot
+    // Ensure server.jar is present for Minecraft servers before boot. Only the
+    // panel-local runtime keeps files under .data; Wings nodes own their own files.
     const upperType = (server.type || "PAPER").toUpperCase();
-    if (!["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)) {
+    if (
+      (!server.runtimeType || server.runtimeType === "local") &&
+      !["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)
+    ) {
       const jarPath = path.join(serverDir, "server.jar");
       if (!fs.existsSync(jarPath)) {
         try {
@@ -748,9 +817,13 @@ export const changeServerVersion = async (req: Request, res: Response) => {
       server.startupCommand = startupCommand;
     }
 
-    // When changing version for Minecraft servers, download the new JAR
+    // When changing version for Minecraft servers, download the new JAR.
+    // Wings nodes manage their own server files, so only seed the panel-local runtime.
     const upperType = (server.type || type || "PAPER").toUpperCase();
-    if (!["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)) {
+    if (
+      (!server.runtimeType || server.runtimeType === "local") &&
+      !["NODEJS", "NODE", "PYTHON", "PYTHON3"].includes(upperType)
+    ) {
       const jarPath = path.join(serverDir, "server.jar");
       try {
         console.log(`[changeServerVersion] Downloading new server.jar for ${server.name || id} (${upperType} ${version})...`);

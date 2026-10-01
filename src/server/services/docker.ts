@@ -144,9 +144,6 @@ export const checkDockerAlive = async (force = false): Promise<boolean> => {
   }
 };
 
-// Initiate non-blocking initial check
-checkDockerAlive(true).catch(() => {});
-
 // Docker is enabled if explicitly enabled OR if not explicitly set to "false"
 export const isDockerEnabled = process.env.ENABLE_DOCKER !== "false";
 
@@ -181,6 +178,12 @@ export const getDocker = async (nodeId?: string): Promise<Docker> => {
   const nodes = await readJSON("nodes.json") || [];
   const node = nodes.find((n: any) => n.id === nodeId);
   if (node) {
+    if (!node.ip) {
+      throw new Error(
+        `Node "${node.name || node.id}" is a Wings node and does not expose a Docker TCP endpoint. ` +
+          `Wings servers must be managed through the Wings API (runtimeType: "wings"), not the local Docker socket.`
+      );
+    }
     let host = node.ip;
     let protocol: "http" | "https" | "ssh" = "http";
     let port = node.port;
@@ -984,3 +987,6 @@ export const sendContainerCommand = async (containerId: string, command: string,
      console.error("Command error", e);
   }
 };
+
+// Initiate non-blocking initial Docker check after all declarations are initialised
+checkDockerAlive(true).catch(() => {});
