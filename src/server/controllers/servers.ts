@@ -158,7 +158,7 @@ export const createServer = async (req: Request, res: Response) => {
   if (user.role !== "admin" && user.role !== "owner") {
     return res.status(403).json({ error: "Only admins can create servers" });
   }
-  let { name, ram, port, version, theme, cpu, disk, owner, ownerId, ipAlias, type, nodeId, runtimeType, javaVersion, ip } = req.body;
+  let { name, ram, port, version, theme, cpu, disk, owner, ownerId, ipAlias, type, nodeId, runtimeType, javaVersion, ip, image, invocation, runtimeBackend } = req.body;
   const settings = await readJSON("settings.json") || {};
   const isDevPanel = (process.env.PANEL_TYPE === "dev" || process.env.PORT === "3000") && !process.env.FORCE_MAIN_PANEL;
   if (!isDevPanel) {
@@ -236,6 +236,14 @@ export const createServer = async (req: Request, res: Response) => {
     version: version || "26.3",
     javaVersion: javaVersion || "",
     theme: theme || "default",
+    // Resolve the runtime configuration now, from the node's defaults, so the
+    // server is self-describing. Previously these were left unset and the node's
+    // defaultImage/defaultInvocation were only ever read from the daemon's cached
+    // config - so editing the node after the daemon booted had no effect and the
+    // server failed to start with an opaque 500.
+    image: image || selectedNode.defaultImage || "",
+    invocation: invocation || selectedNode.defaultInvocation || "",
+    runtimeBackend: runtimeBackend || selectedNode.runtimeBackend || "docker",
     status: "installing",
     createdAt: new Date().toISOString(),
     containerId: null as string | null,
