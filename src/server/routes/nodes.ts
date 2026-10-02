@@ -5,8 +5,30 @@ import { readJSON, writeJSON } from "../services/db.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getWingsDaemonSource } from "../services/wingsArtifact.js";
 import { buildWingsInstallScript } from "../services/wingsInstallScript.js";
+import { rateLimit, secretsMatch } from "../utils/rateLimit.js";
 
 const router = Router();
+
+// These are amplification guards, not credential-guessing limits. A
+// registration token is 40 hex characters (160 bits), so it cannot be brute
+// forced at any rate reachable here; what these endpoints actually need is a cap
+// on unauthenticated database work. The values are therefore set well above any
+// real operator (who provisions a handful of nodes and may sit behind NAT, so
+// many legitimate registrations share one address) while still stopping a
+// runaway client from pinning the panel with write amplification.
+const registerLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 300,
+  message: "Too many registration attempts. Wait a moment and retry.",
+});
+
+// Default heartbeat is every 15s, but heartbeat_interval is operator-configurable
+// down to a second, and several nodes can legitimately share one address.
+const heartbeatLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 600,
+  message: "Heartbeat rate exceeded for this address.",
+});
 
 async function getNodesList() {
   const nodes = await readJSON("nodes.json");
@@ -33,12 +55,27 @@ function withComputedStatus(node: any, now = Date.now()): any {
   if (node.lastHeartbeat) {
     const diff = now - new Date(node.lastHeartbeat).getTime();
     if (diff > threshold && node.status === "online") {
-      return { ...node, status: "offline" };
+      return {
+        ...node,
+        status: "offline",
+        statusDetail: `No heartbeat for ${Math.round(diff / 1000)}s (threshold ${Math.round(threshold / 1000)}s)`,
+      };
     }
     return node;
   }
+  // No heartbeat ever arrived. The two cases mean very different things to an
+  // operator: a node without an api_secret has not been installed yet, while a
+  // node that already has one but never checked in is broken (wrong secret,
+  // wrong panel_url, or the panel is unreachable from the daemon).
+  if (node.apiSecret) {
+    return {
+      ...node,
+      status: "error",
+      statusDetail: node.statusDetail || "Installed but has never reached the panel",
+    };
+  }
   if (node.status === "online") {
-    return { ...node, status: node.apiSecret ? "offline" : "installing" };
+    return { ...node, status: "installing" };
   }
   return node;
 }
@@ -61,6 +98,10 @@ function stripSecrets(node: any): any {
  *      X-Forwarded-Proto. Correct when the panel is reached directly or through a
  *      tunnel that forwards the public hostname.
  *
+ * Set PANEL_URL_REQUIRED=true to refuse the header fallback entirely. Operators
+ * who terminate TLS or sit behind a proxy should do this: it removes the
+ * attacker-controlled input from a URL that ends up in a `curl | bash` command.
+ *
  * Only http/https origins are ever returned.
  */
 function resolvePanelUrl(req: Request): string {
@@ -73,6 +114,18 @@ function resolvePanelUrl(req: Request): string {
       console.warn(`[JTG] Ignoring invalid PANEL_URL: ${configured}`);
     }
   }
+
+  if (String(process.env.PANEL_URL_REQUIRED).toLowerCase() === "true") {
+    throw new Error(
+      "PANEL_URL is required (PANEL_URL_REQUIRED=true) but is unset or invalid. " +
+        "Set PANEL_URL to this panel's public origin, e.g. https://panel.example.com."
+    );
+  }
+
+  console.warn(
+    "[JTG] PANEL_URL is not set; deriving the installer URL from the request headers. " +
+      "Set PANEL_URL (and optionally PANEL_URL_REQUIRED=true) to pin it."
+  );
 
   // X-Forwarded-* may be a comma separated list; the first entry is the original.
   const firstHeader = (value: any): string => {
@@ -120,7 +173,7 @@ router.get("/install", async (req, res) => {
   }
 });
 
-router.post("/register", async (req, res) => {
+router.post("/register", registerLimiter, async (req, res) => {
   try {
     const { registrationToken } = req.body;
     if (!registrationToken) {
@@ -128,9 +181,11 @@ router.post("/register", async (req, res) => {
     }
 
     const nodes = await getNodesList();
+    // Never compare the token with === : it is a bearer credential, and a
+    // timing side channel here leaks it a byte at a time.
     const nodeIndex = nodes.findIndex(
       (n: any) =>
-        n.registrationToken === registrationToken &&
+        secretsMatch(n.registrationToken, registrationToken) &&
         (!n.registrationTokenExpires || new Date(n.registrationTokenExpires) > new Date())
     );
 
@@ -186,19 +241,28 @@ router.post("/register", async (req, res) => {
   }
 });
 
-router.post("/heartbeat", async (req, res) => {
+router.post("/heartbeat", heartbeatLimiter, async (req: Request, res) => {
   try {
     const authHeader = req.headers.authorization;
     const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
     const { nodeId, apiSecret, version, cpu, memory, disk, uptime, instanceId, systems, resources } = req.body;
 
-    const secret = bearerToken || apiSecret;
+    // The credential must travel in the Authorization header. Accepting it from
+    // the JSON body let it land in request logs, proxies and any body-capture
+    // middleware between the daemon and the panel. The body copy is still read
+    // so it can be actively rejected instead of silently ignored.
+    if (apiSecret) {
+      return res.status(401).json({
+        error: "Unauthorized: send api_secret in the Authorization header, not the request body",
+      });
+    }
+    const secret = bearerToken;
     if (!secret || !nodeId) {
       return res.status(401).json({ error: "Unauthorized: Missing authentication" });
     }
 
     const nodes = await getNodesList();
-    const nodeIndex = nodes.findIndex((n: any) => n.id === nodeId && n.apiSecret === secret);
+    const nodeIndex = nodes.findIndex((n: any) => n.id === nodeId && secretsMatch(n.apiSecret, secret));
 
     if (nodeIndex === -1) {
       return res.status(401).json({ error: "Unauthorized: Invalid node credentials" });

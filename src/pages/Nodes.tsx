@@ -43,6 +43,97 @@ function formatUptime(seconds: number) {
   return `${m}m`;
 }
 
+/**
+ * Single source of truth for how a node status is rendered.
+ *
+ * The backend derives these four states; "error" is not just "offline" - it
+ * means the daemon has an api_secret but has never reached the panel at all, so
+ * the operator is looking at a broken install rather than a node that is merely
+ * disconnected.
+ */
+const NODE_STATUS: Record<string, { label: string; badge: string; dot: string }> = {
+  online: {
+    label: "Online",
+    badge: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30",
+    dot: "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]",
+  },
+  installing: {
+    label: "Installing",
+    badge: "text-amber-400 bg-amber-500/10 border-amber-500/30",
+    dot: "bg-amber-500 animate-pulse",
+  },
+  offline: {
+    label: "Offline",
+    badge: "text-slate-400 bg-slate-500/10 border-slate-500/30",
+    dot: "bg-slate-500",
+  },
+  error: {
+    label: "Error",
+    badge: "text-red-400 bg-red-500/10 border-red-500/30",
+    dot: "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]",
+  },
+};
+
+function statusMeta(status: any): { label: string; badge: string; dot: string } {
+  return NODE_STATUS[status] || NODE_STATUS.offline;
+}
+
+/** Human-readable age of a timestamp, so "stale" is obvious at a glance. */
+function formatAge(iso: string | undefined | null, now: number): string {
+  if (!iso) return "never";
+  const ms = now - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return "unknown";
+  if (ms < 0) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m % 60}m ago`;
+  return `${Math.floor(h / 24)}d ${h % 24}h ago`;
+}
+
+/** Values the daemon reports. Every field is optional: a node can be online with
+ *  partial metrics, and older daemons report less. */
+function nodeStats(node: any) {
+  const s = node?.stats || {};
+  return {
+    cpu: typeof s.cpu === "number" ? s.cpu : null,
+    memory: s.memory && typeof s.memory.total === "number" ? s.memory : null,
+    disk: s.disk && typeof s.disk.total === "number" ? s.disk : null,
+    uptime: typeof s.uptime === "number" ? s.uptime : null,
+    systems: s.systems || null,
+    resources: s.resources || null,
+  };
+}
+
+/** Percentage of a measured pool, guarding against zero/absent totals. */
+function percent(used: number | undefined, total: number | undefined): number | null {
+  if (typeof used !== "number" || typeof total !== "number" || total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round((used / total) * 100)));
+}
+
+function MetricBar(props: { label: string; value: string; pct: number | null; icon?: any }) {
+  const Icon = props.icon;
+  return (
+    <div className="bg-background/80 rounded-xl p-3 border border-border">
+      <div className="text-[10px] text-muted-foreground mb-1 font-mono uppercase tracking-wider flex items-center gap-1">
+        {Icon ? <Icon className="w-3 h-3" /> : null}
+        {props.label}
+      </div>
+      <div className="font-bold text-sm text-foreground">{props.value}</div>
+      {props.pct !== null && (
+        <div className="mt-2 h-1.5 w-full rounded-full bg-border overflow-hidden">
+          <div
+            className="h-full rounded-full bg-theme-500 transition-all"
+            style={{ width: `${props.pct}%` }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Nodes() {
   const [nodes, setNodes] = useState<any[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -69,20 +160,27 @@ export default function Nodes() {
     cpuLimit: 100
   });
 
-  const fetchNodes = async () => {
-    setLoading(true);
+  const fetchNodes = async (background = false) => {
+    // A poll must not blank the page or clear a real error the operator still
+    // needs to see, so the loading state is reserved for the first load.
+    if (!background) setLoading(true);
     try {
       const res = await axios.get("/api/nodes");
       setNodes(res.data);
+      if (background) setError("");
     } catch (err: any) {
       setError(err.response?.data?.error || "Failed to load nodes");
     } finally {
-      setLoading(false);
+      if (!background) setLoading(false);
     }
   };
 
+  // Node status is heartbeat-driven, so a page left open would otherwise show
+  // stale ONLINE/OFFLINE badges indefinitely.
   useEffect(() => {
     fetchNodes();
+    const timer = window.setInterval(() => fetchNodes(true), 15000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const handleCreateNode = async (e: React.FormEvent) => {
@@ -205,20 +303,14 @@ export default function Nodes() {
       ) : (
         <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
           {nodes.map((node: any) => {
-            const isOnline = node.status === "online";
-            const isInstalling = node.status === "installing";
-
-            const statusColor = isOnline
-              ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
-              : isInstalling
-              ? "text-amber-400 bg-amber-500/10 border-amber-500/30"
-              : "text-red-400 bg-red-500/10 border-red-500/30";
-
-            const dotColor = isOnline
-              ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]"
-              : isInstalling
-              ? "bg-amber-500 animate-pulse"
-              : "bg-red-500";
+            const meta = statusMeta(node.status);
+            const stats = nodeStats(node);
+            const now = Date.now();
+            const memPct = percent(stats.memory?.used, stats.memory?.total);
+            const diskPct = percent(stats.disk?.used, stats.disk?.total);
+            const cpuPct = stats.cpu === null ? null : Math.min(100, Math.max(0, Math.round(stats.cpu)));
+            const serversTotal = stats.resources?.servers_total;
+            const serversRunning = stats.resources?.servers_running;
 
             return (
               <div
@@ -229,7 +321,11 @@ export default function Nodes() {
                   <div className="flex items-start justify-between mb-4">
                     <div className="flex items-center gap-3">
                       <div className="p-3 bg-theme-500/10 rounded-xl text-theme-500 border border-theme-500/20">
-                        <Server className="h-6 w-6" />
+                        {node.status === "error" ? (
+                          <ServerCrash className="h-6 w-6 text-red-400" />
+                        ) : (
+                          <Server className="h-6 w-6" />
+                        )}
                       </div>
                       <div>
                         <h3 className="font-bold text-lg text-foreground">{node.name}</h3>
@@ -239,27 +335,104 @@ export default function Nodes() {
                         </p>
                       </div>
                     </div>
-                    <span className={`flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold border uppercase tracking-wider ${statusColor}`}>
-                      <span className={`w-2 h-2 rounded-full mr-1.5 ${dotColor}`} />
-                      {node.status || "OFFLINE"}
+                    <span className={`flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold border uppercase tracking-wider ${meta.badge}`}>
+                      <span className={`w-2 h-2 rounded-full mr-1.5 ${meta.dot}`} />
+                      {meta.label}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3 mt-6">
-                    <div className="bg-background/80 rounded-xl p-3 border border-border">
-                      <div className="text-[10px] text-muted-foreground mb-1 font-mono uppercase tracking-wider">Memory</div>
-                      <div className="font-bold text-sm text-foreground">{Math.round((node.memory || 8192) / 1024)} GB</div>
+                  {node.status === "error" && node.statusDetail && (
+                    <div className="mt-3 flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] text-red-300">
+                      <ShieldAlert className="w-3.5 h-3.5 mt-px shrink-0" />
+                      <span>{node.statusDetail}</span>
                     </div>
+                  )}
+
+                  {/* Measured usage from the daemon's heartbeat. */}
+                  <div className="grid grid-cols-2 gap-3 mt-6">
+                    <MetricBar
+                      label="CPU"
+                      icon={Cpu}
+                      value={stats.cpu === null ? "—" : `${stats.cpu}%`}
+                      pct={cpuPct}
+                    />
+                    <MetricBar
+                      label="RAM"
+                      icon={Activity}
+                      value={
+                        stats.memory
+                          ? `${formatBytes(stats.memory.used * 1024 * 1024)} / ${formatBytes(stats.memory.total * 1024 * 1024)}`
+                          : "—"
+                      }
+                      pct={memPct}
+                    />
+                    <MetricBar
+                      label="Disk"
+                      icon={HardDrive}
+                      value={
+                        stats.disk
+                          ? `${formatBytes(stats.disk.used * 1024 * 1024)} / ${formatBytes(stats.disk.total * 1024 * 1024)}`
+                          : "—"
+                      }
+                      pct={diskPct}
+                    />
                     <div className="bg-background/80 rounded-xl p-3 border border-border">
-                      <div className="text-[10px] text-muted-foreground mb-1 font-mono uppercase tracking-wider">Disk</div>
-                      <div className="font-bold text-sm text-foreground">{Math.round((node.disk || 50000) / 1024)} GB</div>
+                      <div className="text-[10px] text-muted-foreground mb-1 font-mono uppercase tracking-wider flex items-center gap-1">
+                        <Server className="w-3 h-3" /> Servers
+                      </div>
+                      <div className="font-bold text-sm text-foreground">
+                        {typeof serversTotal === "number" ? (
+                          <>
+                            {serversRunning ?? 0}
+                            <span className="text-muted-foreground font-normal"> / {serversTotal}</span>
+                          </>
+                        ) : (
+                          "—"
+                        )}
+                      </div>
+                      {typeof serversTotal === "number" && (
+                        <div className="mt-1 text-[10px] text-muted-foreground font-mono">running</div>
+                      )}
                     </div>
                   </div>
 
-                  {node.lastHeartbeat && (
-                    <div className="mt-4 text-[11px] font-mono text-muted-foreground flex items-center justify-between border-t border-border/50 pt-3">
-                      <span>Last Heartbeat:</span>
-                      <span className="text-foreground">{new Date(node.lastHeartbeat).toLocaleTimeString()}</span>
+                  {/* Provisioned capacity, kept visually separate from the
+                      measured values above so the two are never confused. */}
+                  <div className="mt-3 grid grid-cols-2 gap-3">
+                    <div className="bg-background/40 rounded-xl p-2.5 border border-border/60">
+                      <div className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">Allocated RAM</div>
+                      <div className="text-xs font-semibold text-foreground">{formatBytes((node.memory || 0) * 1024 * 1024)}</div>
+                    </div>
+                    <div className="bg-background/40 rounded-xl p-2.5 border border-border/60">
+                      <div className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">Allocated Disk</div>
+                      <div className="text-xs font-semibold text-foreground">{formatBytes((node.disk || 0) * 1024 * 1024)}</div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 text-[11px] font-mono text-muted-foreground flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border/50 pt-3">
+                    <span className="flex items-center gap-1">
+                      <Clock className="w-3 h-3" /> Last Heartbeat:
+                    </span>
+                    <span className="text-foreground flex items-center gap-2">
+                      {formatAge(node.lastHeartbeat, now)}
+                      {node.wingsVersion && (
+                        <span className="px-1.5 py-0.5 rounded border border-border text-[10px] text-muted-foreground">
+                          Wings v{node.wingsVersion}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+
+                  {(stats.uptime !== null || stats.systems) && (
+                    <div className="mt-2 text-[11px] font-mono text-muted-foreground flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                      <span className="flex items-center gap-1">
+                        <Activity className="w-3 h-3" /> Daemon uptime:
+                      </span>
+                      <span className="text-foreground">
+                        {stats.uptime !== null ? formatUptime(stats.uptime) : "—"}
+                        {stats.systems?.arch ? ` · ${stats.systems.arch}` : ""}
+                        {stats.systems?.backend ? ` · ${stats.systems.backend}` : ""}
+                      </span>
                     </div>
                   )}
                 </div>

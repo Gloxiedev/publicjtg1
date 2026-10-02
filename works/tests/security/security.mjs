@@ -197,6 +197,51 @@ section("Docker image references are validated before exec");
   }
 }
 
+// ------------------------------------------------------ Wings credential handling
+section("Wings credentials must not be accepted from the request body");
+
+{
+  const src = fs.readFileSync(path.join(ROOT, "src/server/routes/nodes.ts"), "utf8");
+
+  // The daemon already sends the secret in the Authorization header. Accepting a
+  // body copy as well let it land in request logs and proxies.
+  check(
+    "heartbeat rejects a body apiSecret",
+    /if \(apiSecret\)\s*\{[\s\S]{0,220}?res\.status\(401\)/.test(src)
+  );
+  check(
+    "heartbeat authenticates from the bearer token only",
+    /const secret = bearerToken;/.test(src)
+  );
+  check("heartbeat no longer falls back to the body secret", !/bearerToken \|\| apiSecret/.test(src));
+
+  // Timing-safe comparison for both bearer credentials.
+  const compareCount = (src.match(/secretsMatch\(/g) || []).length;
+  check("node credentials use timing-safe comparison", compareCount >= 2, `secretsMatch calls=${compareCount}`);
+  check(
+    "no plain === comparison of an apiSecret",
+    !/apiSecret === secret|registrationToken === registrationToken/.test(src)
+  );
+
+  // DoS guards on the two unauthenticated Wings endpoints.
+  check("registration is rate limited", /router\.post\("\/register", registerLimiter/.test(src));
+  check("heartbeat is rate limited", /router\.post\("\/heartbeat", heartbeatLimiter/.test(src));
+
+  // Host-header reflection feeds a `curl | bash` one-liner.
+  check("PANEL_URL_REQUIRED pins the installer URL", /PANEL_URL_REQUIRED/.test(src));
+}
+
+section("rate limiter helper");
+
+{
+  const rl = await import(path.join(ROOT, "src/server/utils/rateLimit.ts"));
+  check("secretsMatch rejects differing secrets", rl.secretsMatch("abc", "abd") === false);
+  check("secretsMatch rejects differing lengths", rl.secretsMatch("abc", "abcd") === false);
+  check("secretsMatch accepts an identical secret", rl.secretsMatch("s3cret", "s3cret") === true);
+  check("secretsMatch rejects non-strings", rl.secretsMatch(null, "x") === false);
+  check("secretsMatch rejects undefined", rl.secretsMatch(undefined, undefined) === false);
+}
+
 await fs.remove(sandbox);
 
 console.log(`\nTotals: PASS=${passed} FAIL=${failed}`);
