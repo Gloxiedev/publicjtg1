@@ -66,7 +66,9 @@ export async function startPanel() {
       ...process.env,
       PORT: "6767",
       NODE_ENV: "production",
-      JWT_SECRET: "local-multinode-test-secret",
+      // Must satisfy the production JWT rules: >= 32 chars and not the value
+      // that used to be hardcoded in this repository's source.
+      JWT_SECRET: "local-multinode-test-secret-value-not-public",
       NODE_EXTRA_CA_CERTS: CA_CERT,
     },
   });

@@ -1,7 +1,7 @@
 import assert from "assert";
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET || "jtg-panel-secret-key-super-secure-change-in-production";
+const JWT_SECRET = process.env.JWT_SECRET || "jtg-panel-secret-key-super-secure-change-in-production-2";
 
 console.log("▶ Running Owner Permissions Verification Test...");
 

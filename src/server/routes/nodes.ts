@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, Request } from "express";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { readJSON, writeJSON } from "../services/db.js";
@@ -48,6 +48,54 @@ function stripSecrets(node: any): any {
   return safe;
 }
 
+/**
+ * Resolve the public base URL of this panel.
+ *
+ * Order of preference:
+ *   1. PANEL_URL - explicit operator configuration. This is the only fully
+ *      trustworthy source behind a reverse proxy, because Host and
+ *      X-Forwarded-* are attacker-controllable unless a proxy is known to
+ *      sanitise them. Reflecting them into a `curl | bash` one-liner is a
+ *      copy-paste RCE lure.
+ *   2. X-Forwarded-Host / Host, with the scheme from req.secure or
+ *      X-Forwarded-Proto. Correct when the panel is reached directly or through a
+ *      tunnel that forwards the public hostname.
+ *
+ * Only http/https origins are ever returned.
+ */
+function resolvePanelUrl(req: Request): string {
+  const configured = (process.env.PANEL_URL || "").trim().replace(/\/+$/, "");
+  if (configured) {
+    try {
+      const parsed = new URL(configured);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.origin;
+    } catch {
+      console.warn(`[JTG] Ignoring invalid PANEL_URL: ${configured}`);
+    }
+  }
+
+  // X-Forwarded-* may be a comma separated list; the first entry is the original.
+  const firstHeader = (value: any): string => {
+    const raw = Array.isArray(value) ? value[0] : value;
+    return String(raw || "").split(",")[0].trim();
+  };
+
+  const forwardedHost = firstHeader(req.headers["x-forwarded-host"]);
+  const host = forwardedHost || firstHeader(req.headers.host) || "localhost:6767";
+  const forwardedProto = firstHeader(req.headers["x-forwarded-proto"]).toLowerCase();
+  const protocol = req.secure || forwardedProto === "https" ? "https" : "http";
+
+  try {
+    const parsed = new URL(`${protocol}://${host}`);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return `http://localhost:${process.env.PORT || 6767}`;
+    }
+    return parsed.origin;
+  } catch {
+    return `http://localhost:${process.env.PORT || 6767}`;
+  }
+}
+
 router.get("/daemon.js", async (_req, res) => {
   try {
     const { content } = await getWingsDaemonSource();
@@ -61,9 +109,7 @@ router.get("/daemon.js", async (_req, res) => {
 
 router.get("/install", async (req, res) => {
   try {
-    const host = req.headers.host || "localhost:6767";
-    const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
-    const panelUrl = `${protocol}://${host}`;
+    const panelUrl = resolvePanelUrl(req);
     const script = await buildWingsInstallScript({ panelUrl });
     res.setHeader("Content-Type", "text/x-shellscript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -337,9 +383,7 @@ router.get("/:id/configuration", requireAuth, requireAdmin, async (req, res) => 
     const node = nodes.find((n: any) => n.id === id);
     if (!node) return res.status(404).json({ error: "Node not found" });
 
-    const host = req.headers.host || "localhost:6767";
-    const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
-    const panelUrl = `${protocol}://${host}`;
+    const panelUrl = resolvePanelUrl(req);
 
     let regToken = node.registrationToken;
     if (!regToken || (node.registrationTokenExpires && new Date(node.registrationTokenExpires) < new Date())) {

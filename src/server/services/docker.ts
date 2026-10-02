@@ -3,9 +3,24 @@ import axios from "axios";
 import fs from "fs-extra";
 import path from "path";
 import os from "os";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/**
+ * Accept only plain Docker image references such as "nginx:1.25" or
+ * "ghcr.io/org/name:tag". Anything with whitespace, quotes, semicolons or shell
+ * metacharacters is rejected, because image names can be supplied by a server
+ * owner and are used to build a docker command line.
+ */
+const IMAGE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._\/-]*(:[A-Za-z0-9._-]+)?$/;
+
+export const isSafeImageReference = (image: unknown): boolean => {
+  if (typeof image !== "string") return false;
+  if (image.length === 0 || image.length > 255) return false;
+  return IMAGE_REFERENCE.test(image);
+};
 
 import { panelEvents } from "../events.js"; // Import socket for logs
 import { readJSON } from "./db.js";
@@ -82,7 +97,11 @@ export const autoHealDocker = async (): Promise<boolean> => {
     const sock = getSocketPath();
     await execAsync("sudo systemctl start docker 2>/dev/null || systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null || service docker start 2>/dev/null || true").catch(() => {});
     if (fs.existsSync(sock)) {
-      await execAsync(`chmod 666 ${sock} 2>/dev/null || sudo chmod 666 ${sock} 2>/dev/null || true`).catch(() => {});
+      // Never widen the socket to world-writable. Access is granted by adding the
+      // panel's user to the docker group, which the installer does.
+      console.warn(
+        `[Docker] ${sock} is not accessible to this process. Add the panel user to the docker group: sudo usermod -aG docker "$(id -un)" (then re-login).`
+      );
     }
     await new Promise(r => setTimeout(r, 600));
     const d = await getDocker("local");
@@ -405,9 +424,16 @@ export const createServerContainer = async (serverData: any, nodeId?: string) =>
   const pullImageStream = async (imgTag: string) => {
     console.log(`Pulling image ${imgTag}...`);
     const engine = "docker";
+    // The image name is user controlled (a server owner can set it), so reject
+    // anything that is not a plain image reference. Interpolating it into a shell
+    // string would let a low-privileged user run arbitrary commands as the panel.
+    if (!isSafeImageReference(imgTag)) {
+      throw new Error(`Refusing to pull image: invalid image reference ${JSON.stringify(imgTag)}`);
+    }
     try {
-      console.log(`Executing: ${engine} pull ${imgTag}`);
-      const { stdout, stderr } = await execAsync(`${engine} pull ${imgTag}`);
+      // execFile passes the reference as a single argv entry, so shell
+      // metacharacters are never interpreted.
+      const { stdout, stderr } = await execFileAsync(engine, ["pull", imgTag]);
       console.log(`${engine} pull stdout:`, stdout);
       if (stderr) console.warn(`${engine} pull stderr:`, stderr);
       return;
@@ -591,9 +617,8 @@ export const createServerContainer = async (serverData: any, nodeId?: string) =>
   } catch (err: any) {
     const errStr = String(err?.message || err);
     if ((errStr.includes("ECONNREFUSED") || errStr.includes("docker.sock") || errStr.includes("EACCES")) && process.platform === "linux") {
-      console.warn(`[Docker] Connection issue on docker.sock (${errStr}). Attempting socket permission auto-heal...`);
+      console.warn(`[Docker] Connection issue on the Docker socket (${errStr}). Retrying after ensuring the daemon is running...`);
       try {
-        await execAsync("chmod 666 /var/run/docker.sock 2>/dev/null || sudo chmod 666 /var/run/docker.sock 2>/dev/null || true");
         await execAsync("sudo systemctl start docker 2>/dev/null || systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null || service docker start 2>/dev/null || true");
         await new Promise(r => setTimeout(r, 600));
         const retryDocker = await getDocker(nodeId || serverData.nodeId);

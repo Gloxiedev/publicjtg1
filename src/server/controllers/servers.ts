@@ -22,6 +22,7 @@ import path from "path";
 import { ZipArchive } from "archiver";
 import extract from "extract-zip";
 import { extractArchive } from "../utils/extract.js";
+import { getServerDir, resolveWithin } from "../utils/safePath.js";
 
 const serverOperationLocks = new Set<string>();
 
@@ -862,15 +863,23 @@ const checkServerFileAccess = async (req: Request, res: Response): Promise<boole
   return true;
 };
 
+const BACKUPS_ROOT = path.join(process.cwd(), ".data", "backups");
+
+const getBackupDir = (id: unknown): string | null => {
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return null;
+  return path.join(BACKUPS_ROOT, id);
+};
+
 // File manager basics
 export const getFiles = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id } = req.params;
   const dirPath = req.query.path ? String(req.query.path) : "/";
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath);
-  
-  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, dirPath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {
@@ -904,11 +913,12 @@ export const uploadChunk = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Missing parameters" });
   }
 
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath || "/");
-  const partFilePath = path.join(targetPath, fileName + '.part');
-
-  if (!partFilePath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, dirPath || "/");
+  const partFilePath = targetPath && resolveWithin(targetPath, fileName + ".part");
+  if (!targetPath || !partFilePath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {
@@ -942,12 +952,13 @@ export const completeUpload = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Missing parameters" });
   }
 
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, dirPath || "/");
-  const finalFilePath = path.join(targetPath, fileName);
-  const partFilePath = path.join(targetPath, fileName + '.part');
-  
-  if (!finalFilePath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, dirPath || "/");
+  const finalFilePath = targetPath && resolveWithin(targetPath, fileName);
+  const partFilePath = targetPath && resolveWithin(targetPath, fileName + ".part");
+  if (!targetPath || !finalFilePath || !partFilePath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {
@@ -977,11 +988,11 @@ export const uploadFile = async (req: Request, res: Response) => {
     }
   }
 
-  const serverBase = path.join(process.cwd(), ".data", "servers", id);
-  const targetPath = path.join(serverBase, dirPath);
-  
-  if (!targetPath.startsWith(serverBase)) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverBase = getServerDir(id);
+  if (!serverBase) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverBase, dirPath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   if (req.file) {
@@ -995,16 +1006,19 @@ export const uploadFile = async (req: Request, res: Response) => {
 export const deleteFile = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id } = req.params;
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
   const filePaths = req.body.paths || (req.body.path ? [req.body.path] : []);
-  
+
   try {
     for (const filePath of filePaths) {
-      const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
-      
-      if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-        return res.status(403).json({ error: "Invalid path" });
+      const targetPath = resolveWithin(serverDir, filePath);
+      if (!targetPath) {
+        return res.status(400).json({ error: "Invalid path" });
       }
-      
+      if (path.resolve(targetPath) === path.resolve(serverDir)) {
+        return res.status(400).json({ error: "Refusing to delete the server root directory" });
+      }
       await fs.remove(targetPath);
     }
     res.json({ success: true });
@@ -1018,11 +1032,15 @@ export const zipFiles = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { dirPath, fileNames, outputName } = req.body;
   
-  const baseDir = path.join(process.cwd(), ".data", "servers", id, dirPath);
-  const outZipPath = path.join(baseDir, outputName || "archive.zip");
-
-  if (!baseDir.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const baseDir = resolveWithin(serverDir, dirPath);
+  if (!baseDir) {
+    return res.status(400).json({ error: "Invalid path" });
+  }
+  const outZipPath = resolveWithin(baseDir, outputName || "archive.zip");
+  if (!outZipPath) {
+    return res.status(400).json({ error: "Invalid output file name" });
   }
 
   try {
@@ -1061,12 +1079,13 @@ export const renameFile = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { oldPath, newPath } = req.body;
 
-  const targetOldPath = path.join(process.cwd(), ".data", "servers", id, oldPath);
-  const targetNewPath = path.join(process.cwd(), ".data", "servers", id, newPath);
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetOldPath = resolveWithin(serverDir, oldPath);
+  const targetNewPath = resolveWithin(serverDir, newPath);
 
-  if (!targetOldPath.startsWith(path.join(process.cwd(), ".data", "servers", id)) ||
-      !targetNewPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  if (!targetOldPath || !targetNewPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {
@@ -1091,15 +1110,16 @@ export const downloadFile = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "No path specified" });
   }
 
-  const serverBaseDir = path.join(process.cwd(), ".data", "servers", id);
+  const serverBaseDir = getServerDir(id);
+  if (!serverBaseDir) return res.status(400).json({ error: "Invalid server id" });
 
   try {
     if (rawPaths.length === 1) {
       const singlePath = rawPaths[0];
-      const targetPath = path.join(serverBaseDir, singlePath);
+      const targetPath = resolveWithin(serverBaseDir, singlePath);
 
-      if (!targetPath.startsWith(serverBaseDir)) {
-        return res.status(403).json({ error: "Invalid path" });
+      if (!targetPath) {
+        return res.status(400).json({ error: "Invalid path" });
       }
 
       const stat = await fs.stat(targetPath);
@@ -1123,8 +1143,8 @@ export const downloadFile = async (req: Request, res: Response) => {
     archive.pipe(res);
 
     for (const relPath of rawPaths) {
-      const targetPath = path.join(serverBaseDir, relPath);
-      if (!targetPath.startsWith(serverBaseDir)) continue;
+      const targetPath = resolveWithin(serverBaseDir, relPath);
+      if (!targetPath) continue;
       const itemName = path.basename(targetPath);
       const stat = await fs.stat(targetPath).catch(() => null);
       if (!stat) continue;
@@ -1151,11 +1171,11 @@ export const unzipFile = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Archive file path is required" });
   }
 
-  const serverBaseDir = path.join(process.cwd(), ".data", "servers", id);
-  let targetPath = path.join(serverBaseDir, filePath);
-  
-  if (!targetPath.startsWith(serverBaseDir)) {
-    return res.status(403).json({ error: "Invalid path: Access outside server directory is forbidden" });
+  const serverBaseDir = getServerDir(id);
+  if (!serverBaseDir) return res.status(400).json({ error: "Invalid server id" });
+  let targetPath = resolveWithin(serverBaseDir, filePath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path: Access outside server directory is forbidden" });
   }
 
   if (!fs.existsSync(targetPath)) {
@@ -1199,9 +1219,11 @@ export const createFile = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id } = req.params;
   const { filePath } = req.body;
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
-  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, filePath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
   try {
     await fs.writeFile(targetPath, "", "utf-8");
@@ -1215,9 +1237,11 @@ export const createDirectory = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id } = req.params;
   const { filePath } = req.body;
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
-  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, filePath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
   try {
     await fs.mkdir(targetPath, { recursive: true });
@@ -1232,10 +1256,11 @@ export const saveFileContent = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { filePath, content } = req.body;
 
-  const targetPath = path.join(process.cwd(), ".data", "servers", id, filePath);
-
-  if (!targetPath.startsWith(path.join(process.cwd(), ".data", "servers", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const serverDir = getServerDir(id);
+  if (!serverDir) return res.status(400).json({ error: "Invalid server id" });
+  const targetPath = resolveWithin(serverDir, filePath);
+  if (!targetPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {
@@ -1312,11 +1337,11 @@ export const createBackup = async (req: Request, res: Response) => {
 export const downloadBackup = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id, filename } = req.params;
-  const backupPath = path.join(process.cwd(), ".data", "backups", id, filename);
-
-  // basic path traversal prevention
-  if (!backupPath.startsWith(path.join(process.cwd(), ".data", "backups", id))) {
-    return res.status(403).send("Invalid path");
+  const backupDir = getBackupDir(id);
+  if (!backupDir) return res.status(400).send("Invalid server id");
+  const backupPath = resolveWithin(backupDir, filename);
+  if (!backupPath) {
+    return res.status(400).send("Invalid path");
   }
 
   if (await fs.pathExists(backupPath)) {
@@ -1329,10 +1354,11 @@ export const downloadBackup = async (req: Request, res: Response) => {
 export const deleteBackup = async (req: Request, res: Response) => {
   if (!(await checkServerFileAccess(req, res))) return;
   const { id, filename } = req.params;
-  const backupPath = path.join(process.cwd(), ".data", "backups", id, filename);
-
-  if (!backupPath.startsWith(path.join(process.cwd(), ".data", "backups", id))) {
-    return res.status(403).json({ error: "Invalid path" });
+  const backupDir = getBackupDir(id);
+  if (!backupDir) return res.status(400).json({ error: "Invalid server id" });
+  const backupPath = resolveWithin(backupDir, filename);
+  if (!backupPath) {
+    return res.status(400).json({ error: "Invalid path" });
   }
 
   try {

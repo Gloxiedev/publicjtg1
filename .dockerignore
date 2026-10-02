@@ -3,3 +3,18 @@ node_modules
 .data
 backups
 !dist
+
+# Keep secrets and host state out of the image layer.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+.data
+backups
+.wrangler
+cloudflared.yml
+.gitignore
+works/temporary
+works/debug

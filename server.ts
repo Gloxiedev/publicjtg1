@@ -7,11 +7,35 @@ import { Server as SocketIOServer } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import fs from "fs-extra";
 import jwt from "jsonwebtoken";
+import { getJwtSecret } from "./src/server/services/jwtSecret.js";
+
+const JWT_SECRET = getJwtSecret();
+
+// Behind Cloudflare Tunnel (or any reverse proxy) the client IP and the original
+// scheme arrive in X-Forwarded-* headers. Without trust proxy, req.secure is
+// always false and req.ip is the proxy, which breaks HTTPS detection and any
+// future IP-based control. trust proxy is opt-in and loopback-restricted so a
+// direct client cannot spoof these headers.
+const TRUST_PROXY =
+  process.env.TRUST_PROXY === "true"
+    ? 1 // first hop only
+    : process.env.TRUST_PROXY === "loopback"
+      ? "loopback"
+      : false;
+
+// Only allow browser origins that are actually this panel, unless the operator
+// opts out. A wildcard origin lets any website talk to the panel API.
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || process.env.PANEL_URL || "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
 
 const app = express();
+if (TRUST_PROXY !== false) app.set("trust proxy", TRUST_PROXY);
+
 const httpServer = createServer(app);
 export const io = new SocketIOServer(httpServer, {
-  cors: { origin: "*" },
+  cors: CORS_ORIGINS.length ? { origin: CORS_ORIGINS } : { origin: false },
 });
 app.set("io", io);
 
@@ -40,7 +64,7 @@ io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) return next(new Error("Authentication error"));
   try {
-    const verified = jwt.verify(token, process.env.JWT_SECRET || "jtg-panel-super-secret");
+    const verified = jwt.verify(token, JWT_SECRET) as any;
     (socket as any).user = verified;
     next();
   } catch (err) {
@@ -50,13 +74,19 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   socket.on("joinServer", async (serverId) => {
-    socket.join(`server_${serverId}`);
-
     try {
       const serversJSON = await fs.readFile(path.join(DATA_DIR, "servers.json"), "utf8");
       const servers = JSON.parse(serversJSON);
       const server = Array.isArray(servers) ? servers.find((s: any) => s.id === serverId) : null;
       if (!server) return;
+
+      // Authorise before joining the room, otherwise any authenticated account
+      // can subscribe to another tenant's live console and logs.
+      const user = (socket as any).user;
+      const isAdmin = user?.role === "admin" || user?.role === "owner";
+      if (!isAdmin && server.owner !== user?.id) return;
+
+      socket.join(`server_${serverId}`);
 
       const logs = await getServerRuntimeLogs(server);
       if (logs) {
@@ -78,9 +108,24 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : (process.env.NODE_ENV === "development" ? 3000 : 6767);
 const isDev = process.env.NODE_ENV === "development" && PORT === 3000;
 
+// BIND_ADDRESS=127.0.0.1 keeps the panel reachable only from this host, which is
+// what you want when a Cloudflare Tunnel is the only public entry point.
+// BIND_ADDRESS=0.0.0.0 exposes the port directly (firewall permitting).
+const BIND_ADDRESS = process.env.BIND_ADDRESS || "0.0.0.0";
+
 app.use(express.json({ limit: "50gb" }));
 app.use(express.urlencoded({ extended: true, limit: "50gb" }));
-app.use(cors());
+// Restrict cross-origin browser access to the panel's own origin. With no
+// configured origin the panel is same-origin only, which is the correct default
+// for a reverse-proxied deployment.
+app.use(
+  cors({
+    origin: CORS_ORIGINS.length ? CORS_ORIGINS : false,
+    credentials: false,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type"],
+  })
+);
 
 import apiRoutes from "./src/server/routes/api.js";
 app.use("/api", apiRoutes);
@@ -126,6 +171,17 @@ async function ensureOwnerFromEnv() {
 }
 
 async function startServer() {
+  // Print the resolved configuration before anything can fail. If the process
+  // dies during startup this line is the first thing to check in the PM2 log:
+  // it shows which .env was loaded and which values actually reached the
+  // process (remember that a PM2 `env:` block overrides .env).
+  console.log(
+    `[JTG] Starting: node=${process.version} env=${process.env.NODE_ENV || "(unset)"} ` +
+      `port=${PORT} bind=${BIND_ADDRESS} cwd=${process.cwd()} ` +
+      `dotenv=${process.env.DOTENV_CONFIG_PATH || path.resolve(".env")}${fs.existsSync(path.resolve(".env")) ? "" : " (missing)"} ` +
+      `jwt_secret=${process.env.JWT_SECRET ? `${JWT_SECRET.length} chars (set)` : "MISSING"}`
+  );
+
   await ensureOwnerFromEnv();
   await initSFTPServer();
 
@@ -143,18 +199,45 @@ async function startServer() {
     });
   }
 
-  httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`JTG Panel running on port ${PORT}`);
+  httpServer.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(
+        `[JTG] Cannot start: port ${PORT} is already in use on ${BIND_ADDRESS}.\n` +
+          `      Find the holder with:  ss -lntp | grep ':${PORT}'\n` +
+          `      Or stop it, or set a different PORT in .env`
+      );
+    } else {
+      console.error(`[JTG] HTTP server error:`, err);
+    }
+    process.exit(1);
+  });
+  httpServer.listen(PORT, BIND_ADDRESS, () => {
+    console.log(`JTG Panel running on port ${PORT} (bound to ${BIND_ADDRESS})`);
   });
 }
 
-startServer();
+// Registered before the server starts so a failure during startup is reported
+// with its real cause instead of being swallowed into crash.log while the
+// process stays alive but never listens on the port.
+function writeCrashLog(detail: string) {
+  try {
+    fs.writeFileSync("crash.log", detail);
+  } catch {}
+}
 
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
-  fs.writeFileSync('crash.log', String(err.stack));
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+  writeCrashLog(String(err?.stack || err));
+  process.exit(1);
 });
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('UNHANDLED REJECTION:', reason);
-  fs.writeFileSync('crash.log', String(reason));
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+  writeCrashLog(String((reason as Error)?.stack || reason));
+  process.exit(1);
+});
+
+startServer().catch((err) => {
+  console.error("[JTG] Startup failed:", err);
+  writeCrashLog(String(err?.stack || err));
+  process.exit(1);
 });

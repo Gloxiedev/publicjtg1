@@ -2,8 +2,16 @@ import { Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { readJSON, writeJSON } from "../services/db.js";
+import { getJwtSecret } from "../services/jwtSecret.js";
 
-const JWT_SECRET = process.env.JWT_SECRET || "jtg-panel-super-secret";
+const JWT_SECRET = getJwtSecret();
+
+/**
+ * Dev convenience login: sign in without a password. This is opt-in only and is
+ * hard-disabled in production so a stray NODE_ENV can never expose the panel.
+ */
+const DEV_AUTH_BYPASS =
+  process.env.DEV_AUTH_BYPASS === "true" && process.env.NODE_ENV !== "production";
 
 export const register = async (req: Request, res: Response) => {
   const settings = await readJSON("settings.json") || {};
@@ -71,9 +79,7 @@ export const login = async (req: Request, res: Response) => {
     return;
   }
 
-  const isDevMode = process.env.NODE_ENV !== "production" || process.env.PORT === "3000";
-
-  if (isDevMode) {
+  if (DEV_AUTH_BYPASS) {
     const users = await readJSON("users.json") || [];
     let user = users.find((u: any) => u.username === username);
 

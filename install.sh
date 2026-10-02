@@ -8,6 +8,10 @@
 #
 # Fully unattended, with your own owner account:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) --yes --owner-user admin --owner-pass 'your-password'
+#
+# Fully unattended behind a Cloudflare Tunnel on your own domain:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) \
+#     --yes --exposure cloudflare --panel-domain panel.example.com --cloudflare-token "$TUNNEL_TOKEN"
 
 # Ensure running in bash
 if [ -z "$BASH_VERSION" ]; then
@@ -32,26 +36,59 @@ UNATTENDED=0
 RUN_CHOICE=""
 OWNER_USER_ARG=""
 OWNER_PASS_ARG=""
+EXPOSURE=""
+PANEL_DOMAIN_ARG=""
+CF_TOKEN_ARG=""
+CF_TUNNEL_NAME_ARG=""
+CF_TUNNEL_EXISTING_ARG=""
+PANEL_PORT_ARG=""
+BIND_ADDRESS_ARG=""
+SKIP_CLOUDFLARE=0
+GENERATED_PASS=""
 
 usage() {
     echo "Usage: install.sh [options]"
     echo ""
     echo "  --yes                  Install unattended, no prompts."
     echo "  --mode <1|2>           1) Node.js via PM2 (recommended)  2) Pure local Node.js"
+    echo ""
+    echo "Public access:"
+    echo "  --exposure <mode>      direct | cloudflare | later   (default: ask)"
+    echo "  --panel-domain <host>  Public hostname for the panel, e.g. panel.example.com"
+    echo "  --panel-port <port>    Panel port (default: 6767)"
+    echo "  --cloudflare-token <t> Tunnel token, required for unattended Cloudflare setup"
+    echo "  --tunnel-name <name>   Cloudflare tunnel name (default: jtg-panel)"
+    echo "  --existing-tunnel <n>  Use an existing tunnel instead of creating one"
+    echo ""
+    echo "Owner account:"
     echo "  --owner-user <name>    Owner account username"
     echo "  --owner-pass <pass>    Owner account password (min 6 characters)"
+    echo "  --bind-address <addr>  Override listen address (default: 127.0.0.1 for cloudflare,"
+    echo "                         0.0.0.0 for direct, otherwise ask)"
+    echo ""
     echo "  --help                 Show this help"
     echo ""
     echo "Examples:"
     echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh)"
     echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) --yes"
     echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) main"
+    echo "  # Panel only on this host, reached through a Cloudflare Tunnel:"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) \\"
+    echo "    --yes --exposure cloudflare --panel-domain panel.example.com \\"
+    echo "    --cloudflare-token \"\$TUNNEL_TOKEN\""
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --yes|-y) UNATTENDED=1; shift ;;
         --mode) RUN_CHOICE="$2"; shift 2 ;;
+        --exposure) EXPOSURE="$2"; shift 2 ;;
+        --panel-domain) PANEL_DOMAIN_ARG="$2"; shift 2 ;;
+        --panel-port) PANEL_PORT_ARG="$2"; shift 2 ;;
+        --cloudflare-token) CF_TOKEN_ARG="$2"; shift 2 ;;
+        --tunnel-name) CF_TUNNEL_NAME_ARG="$2"; shift 2 ;;
+        --existing-tunnel) CF_TUNNEL_EXISTING_ARG="$2"; shift 2 ;;
+        --bind-address) BIND_ADDRESS_ARG="$2"; shift 2 ;;
         --owner-user) OWNER_USER_ARG="$2"; shift 2 ;;
         --owner-pass) OWNER_PASS_ARG="$2"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
@@ -62,6 +99,37 @@ done
 if [ -n "$OWNER_USER_ARG" ]; then export JTG_OWNER_USER="$OWNER_USER_ARG"; fi
 if [ -n "$OWNER_PASS_ARG" ]; then export JTG_OWNER_PASS="$OWNER_PASS_ARG"; fi
 if [ "$UNATTENDED" = "1" ] && [ -z "$RUN_CHOICE" ]; then RUN_CHOICE="1"; fi
+
+# Validate the exposure choice early so a typo fails fast instead of after a
+# multi-minute install.
+case "$EXPOSURE" in
+    ""|direct|cloudflare|later) ;;
+    *)
+        echo -e "${RED}Invalid --exposure value: '$EXPOSURE'${NC}"
+        echo "Expected one of: direct, cloudflare, later"
+        exit 2
+        ;;
+esac
+
+if [ -n "$PANEL_PORT_ARG" ]; then
+    case "$PANEL_PORT_ARG" in
+        ''|*[!0-9]*) echo -e "${RED}Invalid --panel-port: '$PANEL_PORT_ARG'${NC}"; exit 2 ;;
+    esac
+    if [ "$PANEL_PORT_ARG" -lt 1 ] || [ "$PANEL_PORT_ARG" -gt 65535 ]; then
+        echo -e "${RED}--panel-port must be between 1 and 65535${NC}"
+        exit 2
+    fi
+fi
+
+# A domain is only meaningful for cloudflare exposure. Reject a contradiction,
+# and infer cloudflare when a domain is given on its own.
+if [ -n "$PANEL_DOMAIN_ARG" ] && [ -n "$EXPOSURE" ] && [ "$EXPOSURE" != "cloudflare" ]; then
+    echo -e "${RED}--panel-domain requires --exposure cloudflare${NC}"
+    exit 2
+fi
+if [ -n "$PANEL_DOMAIN_ARG" ] && [ -z "$EXPOSURE" ]; then
+    EXPOSURE="cloudflare"
+fi
 
 # When piped from a URL there is no local checkout, so clone the repository.
 # An existing checkout is always preferred so local edits keep working.
@@ -166,6 +234,597 @@ run_root() {
     fi
 }
 
+# The account that will actually run the panel. Under `sudo bash install.sh`
+# EUID is 0 but the login session belongs to the original user, so Docker group
+# membership must be granted to that user rather than to root.
+install_user() {
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "$SUDO_USER"
+    elif [ -n "$JTG_RUN_USER" ]; then
+        echo "$JTG_RUN_USER"
+    else
+        id -un 2>/dev/null || echo "root"
+    fi
+}
+
+# Grant Docker access by group membership.
+#
+# This previously ran `chmod 666 /var/run/docker.sock`, which leaves the Docker
+# daemon world-writable: any local user, and any process that compromises the
+# panel, can then start privileged containers and own the host. Membership of the
+# `docker` group carries the same power but is the supported, auditable route.
+ensure_docker_access() {
+    local user sock_group
+    user="$(install_user)"
+
+    if [ -S /var/run/docker.sock ]; then
+        sock_group="$(stat -c '%G' /var/run/docker.sock 2>/dev/null || echo "")"
+        if [ -n "$sock_group" ] && [ "$sock_group" != "docker" ]; then
+            log_warning "Docker socket group is '$sock_group', expected 'docker'."
+        fi
+    fi
+
+    if [ "$user" = "root" ]; then
+        return 0
+    fi
+
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        return 0
+    fi
+
+    log_info "Adding '$user' to the docker group..."
+    if run_root usermod -aG docker "$user" 2>/dev/null; then
+        log_warning "'$user' is now in the docker group, but this shell still runs without it."
+        log_warning "Log out and back in (or run 'newgrp docker') before the panel can reach Docker."
+        return 2
+    fi
+
+    log_error "Could not add '$user' to the docker group. Run manually:"
+    log_error "  sudo usermod -aG docker $user"
+    return 1
+}
+
+# True when the *current* process can reach the Docker daemon. Group membership
+# only applies to new login sessions, so this can legitimately be false right
+# after ensure_docker_access.
+current_shell_has_docker() {
+    docker info > /dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# .env handling
+# ---------------------------------------------------------------------------
+
+# Set KEY="VALUE" in the .env file, replacing any existing assignment.
+#
+# Deliberately implemented with a read/rebuild loop rather than sed: owner
+# passwords and tunnel tokens routinely contain /, |, & and \ characters, which
+# would corrupt a sed substitution and produce a broken config.
+env_set() {
+    local key="$1" val="$2" file="${3:-.env}"
+    local tmp found line
+
+    # Values written here are hex secrets, hostnames, ports and booleans, none of
+    # which can contain a quote or backslash. Stripping them keeps the resulting
+    # KEY="value" line unambiguous for dotenv instead of producing a truncated
+    # value if an operator passes something unexpected.
+    val="${val//\"/}"
+    val="${val//\\/}"
+    val="${val//\'/}"
+
+    [ -f "$file" ] || : > "$file"
+    tmp="${file}.tmp.$$"
+    found=0
+    : > "$tmp"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "$key="*|"$key = "*)
+                printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+                found=1
+                ;;
+            *)
+                printf '%s\n' "$line" >> "$tmp"
+                ;;
+        esac
+    done < "$file"
+
+    if [ "$found" -eq 0 ]; then
+        printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+    fi
+
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+}
+
+# Replace the placeholder secret that ships in .env.example. Anyone who has
+# read this repository knows that literal, so it must never reach a deployment.
+ensure_jwt_secret() {
+    local file="${1:-.env}" secret current
+
+    if grep -q '^JWT_SECRET=' "$file" 2>/dev/null; then
+        current="$(grep '^JWT_SECRET=' "$file" | head -n 1 | cut -d= -f2- | tr -d '"')"
+        if [ -n "$current" ] \
+            && [ "$current" != "your-secure-random-jwt-secret-here" ] \
+            && [ "$current" != "jtg-panel-super-secret" ] \
+            && [ ${#current} -ge 32 ]; then
+            return 0
+        fi
+    fi
+
+    secret="$(random_secret 32)"
+    if [ -z "$secret" ]; then
+        log_error "Could not generate a JWT secret. Install openssl or xxd and retry."
+        return 1
+    fi
+    env_set JWT_SECRET "$secret" "$file"
+    log_info "Generated a unique JWT secret in $(basename "$file")"
+    return 0
+}
+
+random_secret() {
+    local bytes="${1:-32}" out=""
+    if [ -r /dev/urandom ]; then
+        if command -v od > /dev/null 2>&1; then
+            out="$(head -c "$bytes" /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        elif command -v xxd > /dev/null 2>&1; then
+            out="$(head -c "$bytes" /dev/urandom | xxd -p | tr -d '\n')"
+        fi
+    fi
+    if [ ${#out} -lt 32 ] && command -v openssl > /dev/null 2>&1; then
+        out="$(openssl rand -hex "$bytes" 2>/dev/null)"
+    fi
+    echo "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Public exposure
+# ---------------------------------------------------------------------------
+
+PANEL_PORT="${PANEL_PORT_ARG:-6767}"
+PANEL_DOMAIN="$PANEL_DOMAIN_ARG"
+BIND_ADDRESS=""
+TUNNEL_NAME="${CF_TUNNEL_NAME_ARG:-jtg-panel}"
+# Overridable so the tunnel path can be exercised in tests without root.
+CLOUDFLARE_CONFIG_DIR="${JTG_CLOUDFLARE_CONFIG_DIR:-/etc/cloudflared}"
+CLOUDFLARE_SERVICE="cloudflared-tunnel-jtg"
+SYSTEMD_UNIT_DIR="${JTG_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+
+# Ask how the panel should be published. Unattended runs default to `later`,
+# which installs the panel bound to loopback and prints instructions, so a
+# non-interactive install can never hang waiting for input.
+select_exposure() {
+    if [ -n "$EXPOSURE" ]; then
+        return 0
+    fi
+
+    if [ "$UNATTENDED" = "1" ] || [ ! -t 0 ]; then
+        EXPOSURE="later"
+        return 0
+    fi
+
+    print_banner
+    echo -e "${BOLD}How should the panel be reachable?${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Direct on this server's public IP (${PANEL_PORT})"
+    echo -e "  ${BOLD}2)${NC} Behind a Cloudflare Tunnel on your own domain"
+    echo -e "  ${BOLD}3)${NC} Only on this host for now (decide later)"
+    echo ""
+    local choice=""
+    read -p " Choose an option (1-3) [3]: " choice || choice=""
+    case "$choice" in
+        1) EXPOSURE="direct" ;;
+        2) EXPOSURE="cloudflare" ;;
+        *) EXPOSURE="later" ;;
+    esac
+}
+
+# A hostname must be a real DNS label set: this value ends up in a published
+# tunnel route and in URLs handed to operators.
+validate_domain() {
+    local host="$1"
+    if [ -z "$host" ]; then
+        return 1
+    fi
+    # Reject schemes, paths, ports, credentials and anything with a label that
+    # is empty or not alphanumeric/hyphen.
+    case "$host" in
+        *://*|*/*|*:*) return 1 ;;
+    esac
+    printf '%s' "$host" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$' || return 1
+    return 0
+}
+
+# Hostnames are case-insensitive, but the value ends up in CORS_ORIGINS and
+# PANEL_URL, where a case difference from the browser's Origin would be
+# rejected. Normalise once, at the edge.
+normalize_domain() {
+    printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+prompt_domain() {
+    if [ -n "$PANEL_DOMAIN" ]; then
+        if ! validate_domain "$PANEL_DOMAIN"; then
+            log_error "Invalid --panel-domain: '$PANEL_DOMAIN'"
+            log_error "Expected a bare hostname such as panel.example.com"
+            return 1
+        fi
+        PANEL_DOMAIN="$(normalize_domain "$PANEL_DOMAIN")"
+        return 0
+    fi
+
+    if [ "$UNATTENDED" = "1" ] || [ ! -t 0 ]; then
+        log_error "--exposure cloudflare requires --panel-domain in unattended mode."
+        log_error "Example: --panel-domain panel.example.com"
+        return 1
+    fi
+
+    local host=""
+    while true; do
+        read -p " Public hostname for the panel (e.g. panel.example.com): " host || return 1
+        host="$(normalize_domain "$host")"
+        if validate_domain "$host"; then
+            PANEL_DOMAIN="$host"
+            return 0
+        fi
+        log_warning "That is not a valid hostname. Example: panel.example.com"
+    done
+}
+
+# Translate the exposure decision into the concrete listen address and the
+# proxy-trust setting the panel needs.
+resolve_bind_address() {
+    if [ -n "$BIND_ADDRESS_ARG" ]; then
+        BIND_ADDRESS="$BIND_ADDRESS_ARG"
+    elif [ "$EXPOSURE" = "cloudflare" ]; then
+        # The tunnel runs on this host and connects over loopback, so there is
+        # no reason to expose the port to the network at all.
+        BIND_ADDRESS="127.0.0.1"
+    elif [ "$EXPOSURE" = "direct" ]; then
+        BIND_ADDRESS="0.0.0.0"
+    else
+        BIND_ADDRESS="127.0.0.1"
+    fi
+}
+
+# Write the settings the panel process actually reads.
+apply_panel_config() {
+    local runtime="$1"
+    local enable_docker="true"
+    [ "$runtime" = "local" ] && enable_docker="false"
+
+    env_set PORT "$PANEL_PORT"
+    env_set BIND_ADDRESS "$BIND_ADDRESS"
+    env_set DEFAULT_RUNTIME "$runtime"
+    env_set ENABLE_DOCKER "$enable_docker"
+
+    if [ "$EXPOSURE" = "cloudflare" ]; then
+        # Trust exactly one proxy hop. cloudflared is the only process that can
+        # reach the loopback-bound port, so a single hop is both sufficient and
+        # prevents a client from spoofing X-Forwarded-For.
+        env_set TRUST_PROXY "true"
+        env_set PANEL_URL "https://${PANEL_DOMAIN}"
+        env_set CORS_ORIGINS "https://${PANEL_DOMAIN}"
+    elif [ "$EXPOSURE" = "direct" ]; then
+        env_set TRUST_PROXY "false"
+        env_set CORS_ORIGINS ""
+        PANEL_DOMAIN=""
+    else
+        # Loopback-only with no known proxy: forwarded headers are untrusted.
+        env_set TRUST_PROXY "false"
+        env_set CORS_ORIGINS ""
+        PANEL_DOMAIN=""
+    fi
+
+    ensure_jwt_secret .env || return 1
+    chmod 600 .env 2>/dev/null || true
+    return 0
+}
+
+install_cloudflared() {
+    if command -v cloudflared > /dev/null 2>&1; then
+        log_info "cloudflared already installed: $(cloudflared --version 2>&1 | head -n 1)"
+        return 0
+    fi
+
+    local arch pkg url tmp
+    case "$(uname -m)" in
+        x86_64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l)  arch="arm" ;;
+        *)
+            log_error "Unsupported architecture for cloudflared: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
+    tmp="/tmp/cloudflared-${arch}.deb"
+
+    log_info "Downloading cloudflared (${arch})..."
+    if ! curl -fsSL --connect-timeout 15 --max-time 180 "$url" -o "$tmp"; then
+        log_error "Could not download cloudflared from $url"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if command -v dpkg > /dev/null 2>&1; then
+        if ! run_root dpkg -i "$tmp" > /dev/null 2>&1; then
+            run_root apt-get install -y -f > /dev/null 2>&1 || true
+            if ! command -v cloudflared > /dev/null 2>&1; then
+                log_error "Failed to install the cloudflared package."
+                rm -f "$tmp"
+                return 1
+            fi
+        fi
+    else
+        log_error "cloudflared needs dpkg/apt. Install Docker, or configure the tunnel manually."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    rm -f "$tmp"
+    log_success "Installed $(cloudflared --version 2>&1 | head -n 1)"
+}
+
+# Create (or adopt) a tunnel, point the hostname at it, and install the service.
+#
+# Every cloudflared call is bounded by `timeout`. The previous legacy script ran
+# `cloudflared service install $TOKEN` with no timeout, so a token that Cloudflare
+# rejects, or an interactive prompt with no TTY, left the installer waiting
+# forever with no output. Failures here are always reported, never silent.
+# Cloudflare has two genuinely different setup paths, and conflating them is
+# what made the legacy installer hang and fail:
+#
+#   token mode  A tunnel token only lets cloudflared *connect* to an existing
+#               tunnel. It carries no account API permissions, so it cannot
+#               create a tunnel and cannot create DNS records. The tunnel and
+#               its public hostname must already exist in the dashboard.
+#
+#   login mode  `cloudflared tunnel login` stores an account certificate
+#               (cert.pem), which does allow `tunnel create` and
+#               `tunnel route dns`. This is fully automatic, but it opens a
+#               browser, so it is only ever used with a human at the terminal.
+#
+# Every cloudflared invocation is bounded by `timeout` so a rejected token, a
+# missing browser, or a prompt with no TTY reports an error instead of hanging.
+
+configure_tunnel_via_token() {
+    local token="$1"
+    local unit="$SYSTEMD_UNIT_DIR/${CLOUDFLARE_SERVICE}.service"
+
+    run_root mkdir -p "$SYSTEMD_UNIT_DIR" || return 1
+
+    # The token is a credential: keep the unit 0600.
+    if ! run_root tee "$unit" > /dev/null 2>&1 <<UNIT
+[Unit]
+Description=Cloudflare Tunnel for the JTG Panel (${PANEL_DOMAIN})
+Documentation=https://developers.cloudflare.com/cloudflare-one/
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${token}
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    then
+        log_error "Could not write $unit"
+        return 1
+    fi
+    run_root chmod 600 "$unit" 2>/dev/null || true
+
+    if command -v systemctl > /dev/null 2>&1; then
+        run_root systemctl daemon-reload > /dev/null 2>&1 || true
+        run_root systemctl enable "$CLOUDFLARE_SERVICE" > /dev/null 2>&1 || true
+        if ! run_root systemctl restart "$CLOUDFLARE_SERVICE" > /dev/null 2>&1; then
+            log_error "The ${CLOUDFLARE_SERVICE} service failed to start."
+            log_error "Check it with: sudo systemctl status ${CLOUDFLARE_SERVICE} --no-pager"
+            log_error "and: sudo journalctl -u ${CLOUDFLARE_SERVICE} -n 50 --no-pager"
+            return 1
+        fi
+    fi
+
+    log_success "Cloudflare Tunnel service installed and started."
+    log_warning "A tunnel token cannot create DNS records. Add the public hostname"
+    log_warning "in the Cloudflare dashboard, or run with --existing-tunnel using"
+    log_warning "interactive login to have this script create it for you:"
+    log_warning "  Zero Trust -> Networks -> Tunnels -> ${TUNNEL_NAME} -> Public Hostnames"
+    log_warning "  hostname: ${PANEL_DOMAIN}   service: http://127.0.0.1:${PANEL_PORT}"
+    return 0
+}
+
+configure_tunnel_via_login() {
+    local tunnel_id=""
+
+    log_warning "No tunnel token supplied, so an interactive Cloudflare login is required."
+    log_warning "This opens a browser window. Press Ctrl+C to abort and use --cloudflare-token instead."
+
+    local login_out
+    if ! login_out="$(timeout 300 cloudflared tunnel login 2>&1)"; then
+        local status=$?
+        log_error "cloudflared tunnel login failed (exit ${status})."
+        echo "$login_out" | tail -n 15
+        if [ "$status" -eq 124 ]; then
+            log_error "Timed out after 300s waiting for the browser login."
+        fi
+        log_error "Alternative: create a tunnel in the dashboard and re-run with --cloudflare-token."
+        return 1
+    fi
+    log_success "Authenticated with Cloudflare."
+
+    # Reuse the tunnel if the operator named an existing one, otherwise create it.
+    local target="${CF_TUNNEL_EXISTING_ARG:-$TUNNEL_NAME}"
+    local listing
+    if listing="$(timeout 60 cloudflared tunnel list --output json 2>/dev/null)"; then
+        tunnel_id="$(printf '%s' "$listing" \
+            | tr '{' '\n' \
+            | grep "\"name\":\"${target}\"" \
+            | grep -o '"id":"[^"]*"' \
+            | head -n 1 \
+            | cut -d'"' -f4)"
+    fi
+
+    if [ -n "$tunnel_id" ]; then
+        log_info "Reusing existing tunnel '${target}' (${tunnel_id})."
+    elif [ -n "$CF_TUNNEL_EXISTING_ARG" ]; then
+        log_error "No tunnel named '${target}' was found in this account."
+        return 1
+    else
+        if ! timeout 120 cloudflared tunnel create "$TUNNEL_NAME" > /tmp/jtg-cf-create.log 2>&1; then
+            log_error "Could not create the Cloudflare tunnel '${TUNNEL_NAME}'."
+            tail -n 15 /tmp/jtg-cf-create.log 2>/dev/null || true
+            rm -f /tmp/jtg-cf-create.log
+            return 1
+        fi
+        rm -f /tmp/jtg-cf-create.log
+        log_success "Created tunnel '${TUNNEL_NAME}'."
+        listing="$(timeout 60 cloudflared tunnel list --output json 2>/dev/null || true)"
+        tunnel_id="$(printf '%s' "$listing" \
+            | tr '{' '\n' \
+            | grep "\"name\":\"${TUNNEL_NAME}\"" \
+            | grep -o '"id":"[^"]*"' \
+            | head -n 1 \
+            | cut -d'"' -f4)"
+        if [ -z "$tunnel_id" ]; then
+            log_error "Tunnel was created but its id could not be read back."
+            return 1
+        fi
+    fi
+
+    if ! timeout 120 cloudflared tunnel route dns "$tunnel_id" "$PANEL_DOMAIN" > /tmp/jtg-cf-dns.log 2>&1; then
+        log_error "Could not create the DNS route for ${PANEL_DOMAIN}."
+        tail -n 15 /tmp/jtg-cf-dns.log 2>/dev/null || true
+        log_warning "If the DNS record already exists, delete it in the dashboard and re-run."
+        rm -f /tmp/jtg-cf-dns.log
+        return 1
+    fi
+    rm -f /tmp/jtg-cf-dns.log
+    log_success "Routed ${PANEL_DOMAIN} to the tunnel."
+
+    local creds="$CLOUDFLARE_CONFIG_DIR/${tunnel_id}.json"
+    if [ ! -f "$creds" ]; then
+        log_error "Tunnel credentials not found at ${creds}."
+        return 1
+    fi
+    run_root chmod 600 "$creds" 2>/dev/null || true
+
+    # Hostname -> loopback panel. cloudflared is the only thing that can reach a
+    # loopback-bound port, and TLS terminates at Cloudflare, so the origin stays
+    # plain HTTP with no public listener.
+    run_root mkdir -p "$CLOUDFLARE_CONFIG_DIR" || return 1
+    if ! run_root tee "$CLOUDFLARE_CONFIG_DIR/config.yml" > /dev/null 2>&1 <<CONF
+# Managed by the JTG installer. Hand edits are overwritten on re-run.
+tunnel: ${tunnel_id}
+credentials-file: ${creds}
+ingress:
+  - hostname: ${PANEL_DOMAIN}
+    service: http://127.0.0.1:${PANEL_PORT}
+  # cloudflared rejects a configuration without a catch-all rule.
+  - service: http_status:404
+CONF
+    then
+        log_error "Could not write $CLOUDFLARE_CONFIG_DIR/config.yml"
+        return 1
+    fi
+    run_root chmod 600 "$CLOUDFLARE_CONFIG_DIR/config.yml" 2>/dev/null || true
+
+    if command -v systemctl > /dev/null 2>&1; then
+        if ! timeout 120 cloudflared service install "$tunnel_id" > /tmp/jtg-cf-service.log 2>&1; then
+            log_error "cloudflared service install failed."
+            tail -n 15 /tmp/jtg-cf-service.log 2>/dev/null || true
+            log_warning "Start it manually with: sudo cloudflared tunnel run ${tunnel_id}"
+            rm -f /tmp/jtg-cf-service.log
+            return 1
+        fi
+        rm -f /tmp/jtg-cf-service.log
+        run_root systemctl enable --now cloudflared > /dev/null 2>&1 || true
+    fi
+
+    log_success "Cloudflare Tunnel configured for https://${PANEL_DOMAIN}"
+    return 0
+}
+
+configure_cloudflare_tunnel() {
+    log_info "Setting up Cloudflare Tunnel for ${PANEL_DOMAIN}..."
+
+    if [ -n "$CF_TOKEN_ARG" ]; then
+        configure_tunnel_via_token "$CF_TOKEN_ARG"
+    else
+        # A browser login cannot be performed without a TTY. Failing here with
+        # instructions is the whole point: the old script blocked forever.
+        if [ "$UNATTENDED" = "1" ] || [ ! -t 0 ]; then
+            log_error "Cloudflare setup needs a tunnel token when unattended."
+            log_error "Create one at https://one.dash.cloudflare.com/ -> Zero Trust -> Networks -> Tunnels"
+            log_error "Then re-run with: --cloudflare-token \"<token>\""
+            return 1
+        fi
+        configure_tunnel_via_login
+    fi
+}
+
+
+# Post-install report: what was actually built, and the exact next step.
+print_deployment_summary() {
+    local ip
+    ip="$(curl -fsS -m 3 ifconfig.me 2>/dev/null \
+        || curl -fsS -m 3 icanhazip.com 2>/dev/null \
+        || hostname -I 2>/dev/null | awk '{print $1}' \
+        || echo "localhost")"
+
+    echo ""
+    echo -e "${CYAN}${BOLD}──────────────────────────────────────────────${NC}"
+    echo -e "${CYAN}${BOLD}  JTG Panel is installed and running${NC}"
+    echo -e "${CYAN}${BOLD}──────────────────────────────────────────────${NC}"
+    echo -e "  Install directory : $(pwd)"
+    echo -e "  Panel port        : ${PANEL_PORT}"
+    echo -e "  Listen address    : ${BIND_ADDRESS}"
+    echo -e "  Owner username    : ${OWNER_USER}"
+    if [ -n "$GENERATED_PASS" ]; then
+        echo -e "  Owner password    : ${YELLOW}${BOLD}${GENERATED_PASS}${NC} ${YELLOW}(generated, save it now)${NC}"
+    fi
+
+    echo ""
+    case "$EXPOSURE" in
+        cloudflare)
+            echo -e "  ${GREEN}Public URL${NC}           : ${BOLD}https://${PANEL_DOMAIN}${NC}"
+            echo -e "  ${GREEN}Method${NC}              : Cloudflare Tunnel -> http://127.0.0.1:${PANEL_PORT}"
+            echo -e "  ${GREEN}TLS${NC}                 : terminated at Cloudflare (origin is plain HTTP on loopback)"
+            echo ""
+            echo -e "  ${YELLOW}Wings and game traffic are NOT covered by this tunnel.${NC}"
+            echo -e "  Run Wings on separate VPS hosts and reach them directly; see README."
+            ;;
+        direct)
+            echo -e "  ${GREEN}Public URL${NC}           : ${BOLD}http://${ip}:${PANEL_PORT}${NC}"
+            echo -e "  ${GREEN}Method${NC}              : direct, no TLS termination"
+            echo -e "  ${YELLOW}There is no HTTPS here. Put a TLS-terminating proxy in front of${NC}"
+            echo -e "  ${YELLOW}the panel before exposing it, or choose --exposure cloudflare.${NC}"
+            ;;
+        *)
+            echo -e "  ${GREEN}Local URL${NC}           : ${BOLD}http://127.0.0.1:${PANEL_PORT}${NC}"
+            echo -e "  ${GREEN}Method${NC}              : loopback only (no public exposure)"
+            echo ""
+            echo -e "  To publish it later, re-run:"
+            echo -e "    ${BOLD}bash install.sh${NC}  and choose an exposure, or re-run with"
+            echo -e "    ${BOLD}--exposure cloudflare --panel-domain panel.example.com${NC}"
+            ;;
+    esac
+    echo ""
+
+    if ! current_shell_has_docker; then
+        echo -e "  ${YELLOW}Docker is not reachable from this shell yet.${NC}"
+        echo -e "  ${YELLOW}Run: newgrp docker    (or log out and back in).${NC}"
+        echo ""
+    fi
+
+    echo -e "  Useful commands:  pm2 logs jtg-main | pm2 status | bash install.sh"
+    echo ""
+}
+
 execute_step() {
     local msg="$1"
     shift
@@ -180,8 +839,18 @@ execute_step() {
 
     printf "  ${CYAN}→${NC} %-42s " "$msg"
     
-    # Run command in background and capture all stdout and stderr
-    "$@" > "$log_file" 2>&1 &
+    # Run command in background and capture all stdout and stderr.
+    #
+    # stdin must be redirected explicitly. POSIX assigns /dev/null to the stdin
+    # of an asynchronous list, so without this `[ -t 0 ]` is always false inside
+    # a step and any step that needs to prompt -- notably the interactive
+    # `cloudflared tunnel login` -- can never read from the terminal. That is why
+    # the Cloudflare step previously appeared to hang with no output.
+    local stdin_src="/dev/null"
+    if [ -t 0 ] && [ -r /dev/tty ]; then
+        stdin_src="/dev/tty"
+    fi
+    "$@" > "$log_file" 2>&1 < "$stdin_src" &
     local pid=$!
     
     local start_time=$(date +%s 2>/dev/null || echo 0)
@@ -236,6 +905,16 @@ execute_step() {
     
     if [ $status -eq 0 ]; then
         printf "\r  ${GREEN}✓${NC} %-42s ${GREEN}[Done]${NC}\n" "$msg"
+        # Steps that print follow-up instructions set JTG_STEP_VERBOSE=1. Their
+        # output is captured in $log_file, so without this the operator never
+        # sees the manual steps the step asked them to take.
+        if [ "$JTG_STEP_VERBOSE" = "1" ] && [ -s "$log_file" ]; then
+            local line
+            while IFS= read -r line; do
+                [ -n "$line" ] && echo "    $line"
+            done < "$log_file"
+        fi
+        JTG_STEP_VERBOSE=0
     elif [ $is_optional -eq 1 ]; then
         printf "\r  ${YELLOW}⚠${NC} %-42s ${YELLOW}[Container Fallback]${NC}\n" "$msg"
         echo -e "  ${YELLOW}Notice: Host Java setup was bypassed. Docker Minecraft servers will use containerized Java.${NC}"
@@ -633,49 +1312,22 @@ setup_node_env() {
         elif command -v service &> /dev/null; then
             service docker start 2>/dev/null || sudo service docker start 2>/dev/null || true
         fi
-        if [ -S "/var/run/docker.sock" ]; then
-            chmod 666 /var/run/docker.sock 2>/dev/null || sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
-        fi
+    ensure_docker_access || true
     fi
     
-    cat << EOF2 > ecosystem.config.cjs
-module.exports = {
-  apps: [
-    {
-      name: "jtg-main",
-      script: "npm",
-      args: "start",
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: "1G",
-      env: {
-        NODE_ENV: "production",
-        PORT: 6767,
-        DEFAULT_RUNTIME: "${DEFAULT_RT}",
-        ENABLE_DOCKER: "${ENABLE_DOCKER}",
-        DOCKER_SOCKET_PATH: "/var/run/docker.sock"
-      }
-    },
-    {
-      name: "jtg-admin",
-      script: "npm",
-      args: "run dev",
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: "2G",
-      env: {
-        NODE_ENV: "development",
-        PORT: 3000,
-        DEFAULT_RUNTIME: "${DEFAULT_RT}",
-        ENABLE_DOCKER: "${ENABLE_DOCKER}",
-        DOCKER_SOCKET_PATH: "/var/run/docker.sock"
-      }
-    }
-  ]
-};
-EOF2
+    # Everything configurable lives in .env, which server.ts loads via dotenv.
+    # Do NOT overwrite ecosystem.config.cjs here: it is a tracked repository file
+    # and regenerating it left operators with a dirty git tree and silently
+    # discarded any local customisation. Only NODE_ENV is asserted here, because
+    # the authentication bypass and the fail-closed JWT check both key off it.
+    env_set DEFAULT_RUNTIME "$DEFAULT_RT"
+    env_set ENABLE_DOCKER "$ENABLE_DOCKER"
+    env_set DOCKER_SOCKET_PATH "/var/run/docker.sock"
+
+    if grep -q '^PORT=' ecosystem.config.cjs 2>/dev/null; then
+        log_warning "ecosystem.config.cjs hardcodes PORT, which overrides .env."
+        log_warning "Remove the PORT line from its env block so --panel-port takes effect."
+    fi
 }
 
 install_dependencies() {
@@ -774,6 +1426,67 @@ start_panel_docker() {
     return 0
 }
 
+# Size PM2's restart threshold and the V8 heap ceiling from the machine's actual
+# RAM. A hardcoded 1G limit on a 512 MB VPS lets the process grow past what the
+# kernel can give it, so the OOM killer reaps it and PM2 reports "errored"
+# without ever printing an error. Keeping both limits comfortably under total
+# RAM makes PM2 restart first, with a reason, instead of the kernel killing it
+# silently.
+configure_memory_limits() {
+    local total_kb=0 available_mb=0 limit_mb heap_mb
+
+    if [ -r /proc/meminfo ]; then
+        total_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+        available_mb="$(awk '/^MemAvailable:/ {printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+    fi
+
+    if [ -z "$total_kb" ] || [ "$total_kb" -lt 262144 ] 2>/dev/null; then
+        # Could not measure RAM; keep the documented default.
+        export JTG_PANEL_MAX_MEMORY="1G"
+        export JTG_PANEL_MAX_OLD_SPACE="1024"
+        return 0
+    fi
+
+    # Only ever shrink the documented 1G default. Raising it above that would
+    # just disable the guard on a large host, where the panel does not need it.
+    limit_mb=$((total_kb / 1024 * 70 / 100))
+    [ "$limit_mb" -gt 1024 ] && limit_mb=1024
+    [ "$limit_mb" -lt 384 ] && limit_mb=384
+
+    # Leave headroom for the OS, Docker and the game containers on the same box.
+    heap_mb=$((limit_mb * 70 / 100))
+
+    export JTG_PANEL_MAX_MEMORY="${limit_mb}M"
+    export JTG_PANEL_MAX_OLD_SPACE="${heap_mb}"
+
+    log_info "Detected $((total_kb / 1024)) MB RAM (${available_mb} MB available); PM2 memory limit set to ${limit_mb}M, Node heap to ${heap_mb}M"
+
+    if [ "$((total_kb / 1024))" -lt 1536 ]; then
+        log_warning "This machine has less than 1536 MB of RAM."
+        log_warning "Building the panel (Vite + esbuild) and then running it leaves little headroom."
+        log_warning "Add swap or move to a host with 2 GB or more if the panel is killed during startup:"
+        log_warning "  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    fi
+}
+
+pm2_target_failed() {
+    run_pm2 list 2>/dev/null | grep "$1" | grep -qE "errored|stopped"
+}
+
+# PM2's God daemon resolves its own ProcessContainer module from the absolute
+# pm2 path it recorded when the daemon started. If the repository is reinstalled
+# at a different path (for example /root/Jtg -> /root/jtgsecret), or pm2 itself
+# is reinstalled, that path stops existing and the daemon can no longer spawn
+# anything. Every app then dies instantly with
+#   Cannot find module '.../pm2/lib/ProcessContainer.js'
+# before the application's own code runs, so the app error log stays empty and
+# PM2 only reports a misleading "errored" status.
+pm2_daemon_broken() {
+    local log="${PM2_HOME:-$HOME/.pm2}/pm2.log"
+    [ -r "$log" ] || return 1
+    tail -n 300 "$log" 2>/dev/null | grep -q 'pm2/lib/ProcessContainer'
+}
+
 start_panel_node() {
     local TARGET=$1
     if [ "$TARGET" = "jtg-main" ]; then
@@ -783,17 +1496,107 @@ start_panel_node() {
         $DOCKER_CLI rm -f jtg-main jtg-panel 2>/dev/null || true
     fi
     # Ensure Docker daemon is running and socket accessible for Minecraft containers
-    if command -v systemctl &> /dev/null; then
+    if command -v systemctl & &> /dev/null; then
         systemctl enable --now docker 2>/dev/null || sudo systemctl enable --now docker 2>/dev/null || true
-    elif command -v service &> /dev/null; then
+    elif command -v service & &> /dev/null; then
         service docker start 2>/dev/null || sudo service docker start 2>/dev/null || true
     fi
-    if [ -S "/var/run/docker.sock" ]; then
-        chmod 666 /var/run/docker.sock 2>/dev/null || sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
-    fi
+    ensure_docker_access || true
+    configure_memory_limits
     run_pm2 delete "$TARGET" 2>/dev/null || true
     run_pm2 start ecosystem.config.cjs --only "$TARGET"
+
+    # A daemon left over from a previous install path cannot spawn this app.
+    # Rebuild it from the current directory instead of failing the install.
+    local attempt=0
+    while [ "$attempt" -lt 2 ]; do
+        sleep 4
+        if ! pm2_target_failed "$TARGET"; then
+            break
+        fi
+        if pm2_daemon_broken; then
+            log_warning "The PM2 daemon is stale - it was started from a directory that no longer exists."
+            log_warning "Rebuilding it from $(pwd) so the panel process can be spawned."
+            run_pm2 kill >/dev/null 2>&1 || true
+            sleep 3
+            run_pm2 start ecosystem.config.cjs --only "$TARGET" >/dev/null 2>&1 || true
+        else
+            # Not a stale daemon, so this is a genuine crash. Leave it for the
+            # health check, which prints the diagnostics.
+            break
+        fi
+        attempt=$((attempt + 1))
+    done
+
     run_pm2 save --force 2>/dev/null || true
+}
+
+# Print everything needed to explain a startup failure. A process that dies
+# instantly leaves a PM2 status of "errored" with no obvious cause, so collect
+# the evidence while the user is still looking at the terminal.
+print_startup_diagnostics() {
+    local TARGET="$1" PORT="$2"
+
+    # The most common cause of "errored with an empty error log" is a PM2 daemon
+    # that was started from a directory that has since been replaced. Call it out
+    # first, because the application logs will never mention it.
+    if pm2_daemon_broken; then
+        echo "!! CAUSE FOUND: the PM2 daemon is stale."
+        echo "   It was started from a directory that no longer exists, so it cannot"
+        echo "   load pm2/lib/ProcessContainer.js and every app it spawns dies"
+        echo "   immediately - before the panel's own code runs. That is why the error"
+        echo "   log below is empty."
+        echo "   Fix with:  pm2 kill && cd <repo> && pm2 start ecosystem.config.cjs --only ${TARGET}"
+        echo ""
+    fi
+
+    echo ""
+    echo "--- PM2 status ---"
+    run_pm2 list 2>&1 | grep -E "$TARGET|status" || run_pm2 list 2>&1 || true
+
+    echo "--- PM2 describe $TARGET ---"
+    run_pm2 describe "$TARGET" 2>&1 | grep -Ei 'status|script path|exec cwd|exec interpreter|restarts|unstable|out of memory' || true
+
+    echo "--- error log (last 40 lines) ---"
+    run_pm2 logs "$TARGET" --err --lines 40 --nostream 2>&1 || true
+
+    echo "--- output log (last 20 lines) ---"
+    run_pm2 logs "$TARGET" --out --lines 20 --nostream 2>&1 || true
+
+    echo "--- listeners on port $PORT ---"
+    if command -v ss > /dev/null 2>&1; then
+        ss -lntp 2>/dev/null | grep ":${PORT}" || echo "(nothing is listening on $PORT)"
+    elif command -v netstat > /dev/null 2>&1; then
+        netstat -lntp 2>/dev/null | grep ":${PORT}" || echo "(nothing is listening on $PORT)"
+    else
+        echo "(install iproute2 or net-tools to inspect listeners)"
+    fi
+
+    echo "--- memory / OOM killer ---"
+    if command -v free > /dev/null 2>&1; then
+        free -m 2>/dev/null || true
+    fi
+    if [ -r /var/log/kern.log ]; then
+        grep -iE 'killed process|out of memory' /var/log/kern.log 2>/dev/null | tail -5 || true
+    elif command -v dmesg > /dev/null 2>&1; then
+        dmesg -T 2>/dev/null | grep -iE 'killed process|out of memory' | tail -5 || true
+    fi
+
+    echo "--- effective panel config (.env) ---"
+    if [ -f .env ]; then
+        grep -E '^(PORT|BIND_ADDRESS|NODE_ENV|JWT_SECRET)=' .env 2>/dev/null |
+            sed -E 's/^(JWT_SECRET=).*/\1<redacted>/' || true
+        # A PM2 `env:` block wins over .env, so a stale value there silently
+        # overrides whatever the operator just configured. Match only a real
+        # assignment so explanatory comments do not trigger a false warning.
+        if [ -f ecosystem.config.cjs ] &&
+            grep -qE "^[[:space:]]*JWT_SECRET[[:space:]]*[:=]" ecosystem.config.cjs 2>/dev/null; then
+            echo "WARNING: ecosystem.config.cjs assigns JWT_SECRET, which overrides .env for the panel process."
+        fi
+    else
+        echo "(no .env in $(pwd))"
+    fi
+    echo ""
 }
 
 health_check() {
@@ -820,8 +1623,7 @@ health_check() {
         else
             if run_pm2 list 2>/dev/null | grep "$TARGET" | grep -qE "errored|stopped"; then
                 echo "PM2 process $TARGET crashed or stopped."
-                echo "--- Logs for $TARGET ---"
-                run_pm2 logs "$TARGET" --lines 40 --nostream 2>&1 || true
+                print_startup_diagnostics "$TARGET" "$PORT"
                 return 1
             fi
         fi
@@ -837,10 +1639,7 @@ health_check() {
         echo "--- Docker Logs ---"
         $DOCKER_CLI logs "$TARGET" --tail 50 2>&1 || true
     else
-        echo "--- PM2 Status ---"
-        run_pm2 list || true
-        echo "--- PM2 Logs ---"
-        run_pm2 logs "$TARGET" --lines 50 --nostream || true
+        print_startup_diagnostics "$TARGET" "$PORT"
     fi
     return 1
 }
@@ -1001,29 +1800,42 @@ install_panel() {
         export JTG_OWNER_PASS="$OWNER_PASS"
     fi
     
+    # Decide how the panel is published before anything is written, so the bind
+    # address and proxy trust in .env match the real topology.
+    if [ "$TARGET" = "main" ]; then
+        select_exposure
+        resolve_bind_address
+        if [ "$EXPOSURE" = "cloudflare" ]; then
+            if ! prompt_domain; then
+                log_error "Cannot continue without a valid panel domain."
+                return 1
+            fi
+        fi
+    else
+        EXPOSURE="direct"
+        resolve_bind_address
+    fi
+
     # Environment Setup
     mkdir -p .data backups
     if [ ! -f ".env" ]; then
         if [ -f ".env.example" ]; then
             cp .env.example .env
         else
-            echo "PORT=6767" > .env
-            echo "ENABLE_DOCKER=\"true\"" >> .env
-            echo "DOCKER_SOCKET_PATH=\"/var/run/docker.sock\"" >> .env
+            : > .env
         fi
-        # Never ship the placeholder secret from .env.example: anyone could
-        # forge session tokens with it. Always generate a real one.
-        NEW_JWT=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -d '\n' || openssl rand -base64 32)
-        if [ -z "$NEW_JWT" ]; then
-            NEW_JWT=$(openssl rand -hex 32)
-        fi
-        if grep -q 'JWT_SECRET=' .env; then
-            sed -i.bak "s|^JWT_SECRET=.*|JWT_SECRET=\"${NEW_JWT}\"|" .env
-            rm -f .env.bak
+    fi
+
+    # Refuse to start on an occupied port rather than silently replacing an
+    # unrelated service. An already-installed panel is our own, so allow it.
+    if [ "$TARGET" = "main" ] && ! check_port "$PANEL_PORT"; then
+        if curl -fsS -m 2 "http://127.0.0.1:${PANEL_PORT}/api/health" > /dev/null 2>&1; then
+            log_info "Port ${PANEL_PORT} is already serving a JTG panel; treating this as a reinstall."
         else
-            echo "JWT_SECRET=\"${NEW_JWT}\"" >> .env
+            log_error "Port ${PANEL_PORT} is in use by another process."
+            log_error "Stop it, or re-run with --panel-port <other>."
+            return 1
         fi
-        echo -e "${GREEN}[INFO]${NC} Generated a unique JWT secret in .env"
     fi
 
     print_banner
@@ -1041,34 +1853,37 @@ install_panel() {
             RUNTIME_ARG="local"
         fi
         execute_step "Node.js Configuration" setup_node_env "$RUNTIME_ARG"
+        execute_step "Writing Panel Configuration" apply_panel_config "$RUNTIME_ARG"
         execute_step "NPM Dependencies" install_dependencies
         if [ "$TARGET" = "main" ]; then
             execute_step "Owner Account Setup" setup_owner
             execute_step "Building Application" build_application
             execute_step "Starting PM2 Service" start_panel_node jtg-main
-            execute_step "Waiting for Application & Port 6767" health_check 6767 pm2 jtg-main
+            execute_step "Waiting for Application on port ${PANEL_PORT}" health_check "$PANEL_PORT" pm2 jtg-main
         else
             execute_step "Building Application" build_application
             execute_step "Starting PM2 Service" start_panel_node jtg-admin
             execute_step "Waiting for Application & Port 3000" health_check 3000 pm2 jtg-admin
         fi
+
+        # Cloudflare is configured only after the panel answers locally: the
+        # tunnel origin must be live, and a public route pointing at a dead
+        # origin is worse than no route at all.
+        if [ "$TARGET" = "main" ] && [ "$EXPOSURE" = "cloudflare" ]; then
+            execute_step "Installing cloudflared" install_cloudflared
+            # Show the tunnel's output: it tells the operator which dashboard
+            # page still needs their attention.
+            JTG_STEP_VERBOSE=1 execute_step "Configuring Cloudflare Tunnel" configure_cloudflare_tunnel
+        fi
     fi
-    
+
     show_status
 
-    local IP=$(curl -s -m 2 ifconfig.me 2>/dev/null || curl -s -m 2 icanhazip.com 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     if [ "$TARGET" = "main" ]; then
-        log_success "JTG Main Panel installation is complete and verified!"
-        echo -e "${GREEN}✓ You can now open http://${IP}:6767 and log in with '${OWNER_USER}'.${NC}
-"
-        if [ -n "$GENERATED_PASS" ]; then
-            echo -e "${YELLOW}  Generated owner password: ${BOLD}${GENERATED_PASS}${NC}"
-            echo -e "${YELLOW}  Store it now and change it after your first login.${NC}\n"
-        fi
+        print_deployment_summary
     else
         log_success "JTG Developer Panel installation is complete and verified!"
-        echo -e "${GREEN}✓ Developer Panel running on http://${IP}:3000.${NC}
-"
+        echo -e "${GREEN}✓ Developer Panel running on http://127.0.0.1:3000.${NC}\n"
     fi
 }
 

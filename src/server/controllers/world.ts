@@ -5,6 +5,8 @@ import nbt from "prismarine-nbt";
 import { promisify } from "util";
 import * as archiverPkg from "archiver";
 import { extractArchive } from "../utils/extract.js";
+import { readJSON } from "../services/db.js";
+import { getServerDir, resolveWithin } from "../utils/safePath.js";
 
 const archiver = (archiverPkg as any).default || archiverPkg;
 const parseNbt = promisify(nbt.parse);
@@ -135,12 +137,60 @@ async function locateMinecraftWorldFolder(rootDir: string): Promise<ScoredWorldC
   return candidates[0];
 }
 
+/**
+ * Authorise a world request and return the server's directory.
+ *
+ * These routes previously trusted `req.params.id` as a directory name and
+ * `req.body.zipPath` as a relative path with no validation and no ownership
+ * check, so any authenticated account could point them at another tenant's
+ * files or at any path the panel process could reach.
+ */
+async function authorizeWorldRequest(
+  req: Request,
+  res: Response
+): Promise<{ server: any; serverDir: string } | null> {
+  const { id } = req.params;
+  const user = (req as any).user;
+
+  const serverDir = getServerDir(id);
+  if (!serverDir) {
+    res.status(400).json({ error: "Invalid server id" });
+    return null;
+  }
+
+  const servers = (await readJSON("servers.json")) || [];
+  const server = Array.isArray(servers) ? servers.find((s: any) => s.id === id) : null;
+  if (!server) {
+    res.status(404).json({ error: "Server not found" });
+    return null;
+  }
+
+  if (!user || (user.role !== "admin" && user.role !== "owner" && server.owner !== user.id)) {
+    res.status(403).json({ error: "Forbidden: Access denied to this server" });
+    return null;
+  }
+
+  return { server, serverDir };
+}
+
+/** Resolve a client-supplied relative path inside the server directory. */
+function resolveInServer(serverDir: string, relative: unknown, res: Response): string | null {
+  const resolved = resolveWithin(serverDir, relative);
+  if (!resolved) {
+    res.status(400).json({ error: "Invalid path" });
+    return null;
+  }
+  return resolved;
+}
+
 export const getWorldInfo = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const serverDir = path.join(process.cwd(), ".data", "servers", id);
+    const auth = await authorizeWorldRequest(req, res);
+    if (!auth) return;
+    const { serverDir } = auth;
     const levelName = await getLevelName(serverDir);
-    const worldDir = path.join(serverDir, levelName);
+    const worldDir = resolveInServer(serverDir, levelName, res);
+    if (!worldDir) return;
     const levelDatPath = path.join(worldDir, "level.dat");
 
     let worldVersion = "Unknown";
@@ -181,16 +231,19 @@ export const getWorldInfo = async (req: Request, res: Response) => {
 };
 
 export const analyzeWorld = async (req: Request, res: Response) => {
-  const { id } = req.params;
   const { zipPath } = req.body;
-  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+
+  const auth = await authorizeWorldRequest(req, res);
+  if (!auth) return;
+  const { serverDir } = auth;
 
   try {
     if (!zipPath) {
       return res.status(400).json({ error: "Missing zipPath parameter" });
     }
 
-    let zipFullPath = path.join(serverDir, zipPath);
+    let zipFullPath = resolveInServer(serverDir, zipPath, res);
+    if (!zipFullPath) return;
     if (!fs.existsSync(zipFullPath)) {
       return res.status(400).json({ error: "Zip file not found in server directory" });
     }
@@ -271,19 +324,15 @@ export const analyzeWorld = async (req: Request, res: Response) => {
 };
 
 export const importWorld = async (req: Request, res: Response) => {
-  const { id } = req.params;
   const { zipPath, targetFolderName, autoUpdateProperties = true } = req.body;
-  const serverDir = path.join(process.cwd(), ".data", "servers", id);
+
+  const auth = await authorizeWorldRequest(req, res);
+  if (!auth) return;
+  const { server, serverDir } = auth;
+  const { id } = req.params;
 
   try {
     // 1. Verify server is stopped
-    const serversJSON = await fs.readFile(
-      path.join(process.cwd(), ".data", "servers.json"),
-      "utf8"
-    );
-    const servers = JSON.parse(serversJSON);
-    const server = servers.find((s: any) => s.id === id);
-    if (!server) return res.status(404).json({ error: "Server not found" });
 
     if (
       server.status === "running" ||
@@ -295,7 +344,8 @@ export const importWorld = async (req: Request, res: Response) => {
         .json({ error: "Server is currently running. Please stop it first." });
     }
 
-    let zipFullPath = path.join(serverDir, zipPath);
+    let zipFullPath = resolveInServer(serverDir, zipPath, res);
+    if (!zipFullPath) return;
     let origPathToDelete = zipFullPath;
     if (!fs.existsSync(zipFullPath)) {
       return res.status(400).json({ error: "Zip file not found" });
@@ -325,11 +375,20 @@ export const importWorld = async (req: Request, res: Response) => {
 
     // 4. Determine final destination folder name in server root (defaults to 'world' or user's chosen folder)
     const configuredLevel = await getLevelName(serverDir);
-    const chosenFolderName = (targetFolderName || "world" || detected.detectedName || configuredLevel)
+    // A destination folder must be a single safe path segment. Stripping
+    // separators is not enough: "..", "." and absolute paths contain no
+    // separators after cleaning and still escape (or clobber) the server root.
+    const requestedFolder = String(
+      targetFolderName || detected.detectedName || configuredLevel || "world"
+    )
       .trim()
-      .replace(/[/\\?%*:|"<>]/g, "-");
+      .replace(/[/\\?%*:|"<>\u0000-\u001f]/g, "-");
+    const chosenFolderName = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/.test(requestedFolder)
+      ? requestedFolder
+      : "world";
 
-    const finalWorldDestination = path.join(serverDir, chosenFolderName);
+    const finalWorldDestination = resolveInServer(serverDir, chosenFolderName, res);
+    if (!finalWorldDestination) return;
 
     // 5. Create automatic safety backup of current server state before replacing
     const backupDir = path.join(process.cwd(), ".data", "backups", id);

@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-const JWT_SECRET = process.env.JWT_SECRET || "jtg-panel-super-secret";
+import { getJwtSecret } from "../services/jwtSecret.js";
+const JWT_SECRET = getJwtSecret();
 
 export const requireAdmin = async (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
@@ -32,17 +33,19 @@ export const requireAdmin = async (req: Request, res: Response, next: NextFuncti
       apiKey.last_used_at = new Date().toISOString();
       await writeJSON("api_keys.json", apiKeys);
 
-      // Verify the creator is still an admin
+      // The key only carries the privileges of the account that created it, so
+      // revoking or demoting that account must immediately revoke the key.
       const users = await readJSON("users.json") || [];
-      let adminRole = "admin";
-      if (apiKey.created_by !== "temp-admin") {
-        const creator = users.find((u: any) => u.id === apiKey.created_by);
-        if (!creator || (creator.role !== "admin" && creator.role !== "owner")) {
-           res.status(403).json({ error: "Forbidden: API Key creator is no longer an admin" });
-           return;
-        }
-        adminRole = creator.role;
+      const creator = users.find((u: any) => u.id === apiKey.created_by);
+      if (!creator) {
+        res.status(403).json({ error: "Forbidden: API Key creator no longer exists" });
+        return;
       }
+      if (creator.role !== "admin" && creator.role !== "owner") {
+        res.status(403).json({ error: "Forbidden: API Key creator is no longer an admin" });
+        return;
+      }
+      const adminRole = creator.role;
 
       (req as any).user = { id: apiKey.created_by, role: adminRole, isApiKey: true, scopes: apiKey.scopes };
       next();
@@ -60,19 +63,21 @@ export const requireAdmin = async (req: Request, res: Response, next: NextFuncti
        return;
     }
     
-    if (decoded.id !== "temp-admin") {
-      const { readJSON } = await import("../services/db.js");
-      const users = await readJSON("users.json") || [];
-      const user = users.find((u: any) => u.id === decoded.id);
-      if (!user) {
-        res.status(401).json({ error: "User not found" });
-        return;
-      }
-      if ((user.passwordVersion || 0) !== (decoded.passwordVersion || 0)) {
-        res.status(401).json({ error: "Session expired" });
-        return;
-      }
+    // Always re-check the account. Skipping this for a magic id would let a
+    // deleted or demoted user keep admin access until the token expired.
+    const { readJSON } = await import("../services/db.js");
+    const users = await readJSON("users.json") || [];
+    const user = users.find((u: any) => u.id === decoded.id);
+    if (!user) {
+      res.status(401).json({ error: "User not found" });
+      return;
     }
+    if ((user.passwordVersion || 0) !== (decoded.passwordVersion || 0)) {
+      res.status(401).json({ error: "Session expired" });
+      return;
+    }
+    // Trust the stored role, not the role baked into the token.
+    decoded.role = user.role;
     
     (req as any).user = decoded;
     next();
@@ -110,14 +115,15 @@ export const requireAuth = async (req: Request, res: Response, next: NextFunctio
       apiKey.last_used_at = new Date().toISOString();
       await writeJSON("api_keys.json", apiKeys);
 
+      // Inherit the creator's current role. Defaulting to admin when the creator
+      // cannot be found would silently escalate a key after the account is removed.
       const users = await readJSON("users.json") || [];
-      let role = "admin";
-      if (apiKey.created_by !== "temp-admin") {
-        const creator = users.find((u: any) => u.id === apiKey.created_by);
-        if (creator) {
-          role = creator.role;
-        }
+      const creator = users.find((u: any) => u.id === apiKey.created_by);
+      if (!creator) {
+        res.status(403).json({ error: "Forbidden: API Key creator no longer exists" });
+        return;
       }
+      const role = creator.role;
 
       (req as any).user = { id: apiKey.created_by, role, isApiKey: true, scopes: apiKey.scopes };
       next();
@@ -131,20 +137,20 @@ export const requireAuth = async (req: Request, res: Response, next: NextFunctio
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     
-    if (decoded.id !== "temp-admin") {
-      const { readJSON } = await import("../services/db.js");
-      const users = await readJSON("users.json") || [];
-      const user = users.find((u: any) => u.id === decoded.id);
-      if (!user) {
-        res.status(401).json({ error: "User not found" });
-        return;
-      }
-      if ((user.passwordVersion || 0) !== (decoded.passwordVersion || 0)) {
-        res.status(401).json({ error: "Session expired" });
-        return;
-      }
+    const { readJSON } = await import("../services/db.js");
+    const users = await readJSON("users.json") || [];
+    const user = users.find((u: any) => u.id === decoded.id);
+    if (!user) {
+      res.status(401).json({ error: "User not found" });
+      return;
     }
-    
+    if ((user.passwordVersion || 0) !== (decoded.passwordVersion || 0)) {
+      res.status(401).json({ error: "Session expired" });
+      return;
+    }
+    // Trust the stored role, not the role baked into the token.
+    decoded.role = user.role;
+
     (req as any).user = decoded;
     next();
   } catch (err) {
