@@ -297,11 +297,12 @@ async function backendCreate(record) {
   const args = ['create', '-i', '--name', name];
   const memory = `${record.build?.memory || config.serverMemory}m`;
   args.push('--memory', memory);
-  if (alloc && alloc.ip && alloc.port) args.push('-p', `${alloc.ip}:${alloc.port}:${alloc.port}/tcp`);
+  const bindAddress = alloc && alloc.ip ? hostBindAddress(alloc.ip) : '0.0.0.0';
+  if (alloc && alloc.ip && alloc.port) args.push('-p', `${bindAddress}:${alloc.port}:${alloc.port}/tcp`);
   if (config.serverMemory && record.build?.swap === 0) args.push('--memory-swap', memory);
   args.push('-e', `SERVER_MEMORY=${record.build?.memory || config.serverMemory}`);
   args.push('-e', `SERVER_PORT=${alloc ? alloc.port : ''}`);
-  args.push('-e', `SERVER_IP=${alloc ? alloc.ip : ''}`);
+  args.push('-e', `SERVER_IP=${alloc && alloc.ip && isLocalAddress(alloc.ip) ? alloc.ip : ''}`);
   args.push('-e', `SERVER_NAME=${record.meta?.name || record.uuid}`);
   args.push('-e', `SERVER_UUID=${record.uuid}`);
   args.push('-e', `JTG_NODE_ID=${config.nodeId}`);
@@ -598,6 +599,47 @@ async function heartbeatPayload() {
       allocations_assigned: allocations.filter((a) => a.assigned).length,
     },
   };
+}
+
+/**
+ * Addresses actually configured on this host's interfaces.
+ *
+ * On cloud NAT setups (AWS Elastic IP, GCP external IP, most NAT gateways) the
+ * address an allocation advertises is not bound to any local interface, so
+ * Docker cannot publish to it: "cannot assign requested address". Cached because
+ * it is consulted once per container create.
+ */
+let localAddressCache = null;
+function localAddresses() {
+  if (localAddressCache && Date.now() - localAddressCache.at < 60000) return localAddressCache.set;
+  const set = new Set();
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === 'IPv4' && !a.internal) set.add(a.address);
+    }
+  }
+  localAddressCache = { at: Date.now(), set };
+  return set;
+}
+
+function isLocalAddress(ip) {
+  return localAddresses().has(String(ip));
+}
+
+/**
+ * The address to publish a game port on.
+ *
+ * Uses the allocation IP when it is local. Otherwise falls back to every
+ * interface, which still exposes the port through the cloud NAT and is what
+ * makes nodes on Elastic-IP hosts work at all.
+ */
+function hostBindAddress(ip) {
+  if (isLocalAddress(ip)) return String(ip);
+  log(
+    'warn',
+    `allocation ${ip} is not configured on this host; publishing game ports on 0.0.0.0 instead`
+  );
+  return '0.0.0.0';
 }
 
 function postJson(target, pathname, payload, headers) {
