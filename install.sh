@@ -1469,6 +1469,35 @@ configure_memory_limits() {
     fi
 }
 
+# Make the panel come back after a reboot. "pm2 save" only writes the process
+# list to ~/.pm2/dump.pm2; without a systemd boot unit nothing reads it, so the
+# panel stays down after any restart.
+ensure_pm2_boot() {
+    command -v systemctl > /dev/null 2>&1 || {
+        log_warning "systemd is not available; the panel will not return automatically after a reboot."
+        return 0
+    }
+
+    local unit
+    unit="$(systemctl list-unit-files 2>/dev/null | awk '/^pm2[^ ]*\.service/ {print $1; exit}')"
+    if [ -z "$unit" ]; then
+        log_info "Creating a PM2 boot unit so the panel returns after a reboot"
+        run_pm2 startup systemd -u "$(id -un)" --hp "$HOME" > /dev/null 2>&1 ||
+            run_pm2 startup systemd > /dev/null 2>&1 ||
+            true
+        unit="$(systemctl list-unit-files 2>/dev/null | awk '/^pm2[^ ]*\.service/ {print $1; exit}')"
+    fi
+
+    if [ -n "$unit" ]; then
+        systemctl enable "$unit" > /dev/null 2>&1 || true
+        run_pm2 save --force > /dev/null 2>&1 || true
+        log_info "PM2 boot unit enabled ($unit); the panel will start automatically after a reboot."
+    else
+        log_warning "Could not create a PM2 boot unit. Run 'pm2 startup' and 'pm2 save' manually,"
+        log_warning "otherwise the panel will not return after a reboot."
+    fi
+}
+
 pm2_target_failed() {
     run_pm2 list 2>/dev/null | grep "$1" | grep -qE "errored|stopped"
 }
@@ -1529,6 +1558,7 @@ start_panel_node() {
     done
 
     run_pm2 save --force 2>/dev/null || true
+    ensure_pm2_boot
 }
 
 # Print everything needed to explain a startup failure. A process that dies
