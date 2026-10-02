@@ -1,4 +1,4 @@
-import { Router, Request } from "express";
+import { Router, Request, Response } from "express";
 import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { readJSON, writeJSON } from "../services/db.js";
@@ -424,6 +424,98 @@ router.post("/", requireAuth, requireAdmin, async (req, res) => {
   } catch (err: any) {
     console.error("Error creating node:", err);
     res.status(500).json({ error: "Failed to create node" });
+  }
+});
+
+/**
+ * Update a node's configuration.
+ *
+ * Creation was previously the only way to set these fields, which left a node
+ * created without an image/invocation permanently unfixable: the start preflight
+ * tells the operator to configure the node, but no route existed to do it.
+ * Only mutable settings are accepted here; identity, credentials and allocation
+ * bindings stay under their own dedicated routes.
+ */
+router.put("/:id", requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const body = req.body || {};
+    const { name, description, fqdn, hostname, publicIpV4, publicIpV6, wingsPort, apiPort,
+      protocol, ssl, location, memory, disk, cpuLimit, runtimeBackend, defaultImage,
+      defaultInvocation, heartbeatInterval, offlineThreshold } = body;
+
+    const nodes = await getNodesList();
+    const index = nodes.findIndex((n: any) => n.id === id);
+    if (index === -1) {
+      return res.status(404).json({ error: "Node not found" });
+    }
+    const node = nodes[index];
+
+    if (runtimeBackend && !["docker", "process"].includes(runtimeBackend)) {
+      return res.status(400).json({ error: "runtimeBackend must be docker or process" });
+    }
+    if (protocol && !["http", "https"].includes(protocol)) {
+      return res.status(400).json({ error: "Protocol must be http or https" });
+    }
+
+    const nextPort = wingsPort ?? apiPort;
+    if (nextPort !== undefined && nextPort !== null && nextPort !== "") {
+      const resolved = Number(nextPort);
+      if (!Number.isInteger(resolved) || resolved < 1 || resolved > 65535) {
+        return res.status(400).json({ error: "Wings port must be a valid TCP port (1-65535)" });
+      }
+      node.wingsPort = resolved;
+      node.apiPort = resolved;
+    }
+
+    // Assign only what was provided, so a partial update never blanks a field the
+    // caller did not mention.
+    const assign = (key: string, value: any) => {
+      if (value !== undefined) (node as any)[key] = value;
+    };
+
+    if (name !== undefined) {
+      if (!String(name).trim()) return res.status(400).json({ error: "Node name cannot be empty" });
+      assign("name", String(name).trim());
+    }
+    assign("description", description);
+    assign("fqdn", fqdn);
+    assign("hostname", hostname);
+    assign("publicIpV4", publicIpV4);
+    assign("publicIpV6", publicIpV6);
+    assign("protocol", protocol);
+    if (ssl !== undefined) node.ssl = !!ssl;
+    assign("location", location);
+    if (memory !== undefined && Number(memory) > 0) node.memory = Number(memory);
+    if (disk !== undefined && Number(disk) > 0) node.disk = Number(disk);
+    if (cpuLimit !== undefined && Number(cpuLimit) > 0) node.cpuLimit = Number(cpuLimit);
+    assign("runtimeBackend", runtimeBackend);
+    assign("defaultImage", defaultImage);
+    assign("defaultInvocation", defaultInvocation);
+
+    if (heartbeatInterval !== undefined && heartbeatInterval !== "") {
+      const v = Number(heartbeatInterval);
+      if (!Number.isInteger(v) || v < 1000 || v > 300000) {
+        return res.status(400).json({ error: "heartbeatInterval must be 1000-300000 ms" });
+      }
+      node.heartbeatInterval = v;
+    }
+    if (offlineThreshold !== undefined && offlineThreshold !== "") {
+      const v = Number(offlineThreshold);
+      if (!Number.isInteger(v) || v < 1000 || v > 3600000) {
+        return res.status(400).json({ error: "offlineThreshold must be 1000-3600000 ms" });
+      }
+      node.offlineThreshold = v;
+    }
+
+    node.updatedAt = new Date().toISOString();
+    await saveNodesList(nodes);
+
+    const { apiSecret, registrationToken, registrationTokenExpires, ...safeNode } = node;
+    res.json({ success: true, node: safeNode });
+  } catch (err: any) {
+    console.error("Error updating node:", err);
+    res.status(500).json({ error: "Failed to update node" });
   }
 });
 

@@ -144,6 +144,13 @@ export default function Nodes() {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
   const [showToken, setShowToken] = useState(false);
+  const [editNode, setEditNode] = useState<any | null>(null);
+  const [editForm, setEditForm] = useState({
+    runtimeBackend: "docker",
+    defaultImage: "",
+    defaultInvocation: ""
+  });
+  const [savingNode, setSavingNode] = useState(false);
 
   const [formData, setFormData] = useState({
     name: "",
@@ -185,6 +192,32 @@ export default function Nodes() {
     const timer = window.setInterval(() => fetchNodes(true), 15000);
     return () => window.clearInterval(timer);
   }, []);
+
+  const openEditModal = (node: any) => {
+    setEditNode(node);
+    setEditForm({
+      runtimeBackend: node.runtimeBackend || "docker",
+      defaultImage: node.defaultImage || "",
+      defaultInvocation: node.defaultInvocation || ""
+    });
+    setError("");
+  };
+
+  const handleSaveNode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editNode) return;
+    setSavingNode(true);
+    setError("");
+    try {
+      await axios.put(`/api/nodes/${editNode.id}`, editForm);
+      setEditNode(null);
+      fetchNodes(true);
+    } catch (err: any) {
+      setError(err.response?.data?.error || "Failed to update node");
+    } finally {
+      setSavingNode(false);
+    }
+  };
 
   const handleCreateNode = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -444,6 +477,13 @@ export default function Nodes() {
                 </div>
 
                 <div className="flex items-center justify-between gap-2 mt-6 pt-4 border-t border-border">
+                  <button
+                    onClick={() => openEditModal(node)}
+                    className="p-2 rounded-xl border border-border text-muted-foreground hover:text-theme-500 hover:border-theme-500/30 hover:bg-theme-500/10 transition-all cursor-pointer shrink-0"
+                    title="Edit runtime settings"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </button>
                   <button
                     onClick={() => openConfigModal(node)}
                     className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-background border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-theme-500/10 hover:border-theme-500/30 transition-all cursor-pointer"
@@ -714,6 +754,72 @@ export default function Nodes() {
                 </>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* EDIT NODE RUNTIME SETTINGS */}
+      {editNode && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
+          <div className="w-full max-w-lg rounded-2xl border border-border bg-card shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between border-b border-border p-6">
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                <Settings className="w-5 h-5 text-theme-500" /> Edit {editNode.name}
+              </h2>
+              <button onClick={() => setEditNode(null)} className="text-muted-foreground hover:text-foreground">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form onSubmit={handleSaveNode} className="p-6 space-y-4 max-h-[80vh] overflow-y-auto">
+              <p className="text-xs text-muted-foreground">
+                Servers on this node use these values unless they override them. Existing servers keep
+                the image they were created with.
+              </p>
+
+              <div>
+                <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Runtime Backend</label>
+                <select
+                  value={editForm.runtimeBackend}
+                  onChange={e => setEditForm({ ...editForm, runtimeBackend: e.target.value })}
+                  className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                >
+                  <option value="docker">Docker (containers)</option>
+                  <option value="process">Process (no container)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Default Image</label>
+                <input
+                  type="text"
+                  value={editForm.defaultImage}
+                  onChange={e => setEditForm({ ...editForm, defaultImage: e.target.value })}
+                  className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                  placeholder="itzg/minecraft-server:latest"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Default Invocation</label>
+                <input
+                  type="text"
+                  value={editForm.defaultInvocation}
+                  onChange={e => setEditForm({ ...editForm, defaultInvocation: e.target.value })}
+                  className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                  placeholder="java -Xms512M -Xmx{{SERVER_MEMORY}}M -jar server.jar"
+                />
+              </div>
+
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  disabled={savingNode}
+                  className="w-full rounded-xl bg-theme-600 p-3 text-sm font-semibold text-white hover:bg-theme-700 transition-colors cursor-pointer disabled:opacity-60"
+                >
+                  {savingNode ? "Saving..." : "Save Node Settings"}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
