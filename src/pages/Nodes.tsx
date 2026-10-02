@@ -157,7 +157,10 @@ export default function Nodes() {
     location: "Default",
     memory: 8192,
     disk: 50000,
-    cpuLimit: 100
+    cpuLimit: 100,
+    runtimeBackend: "docker",
+    defaultImage: "itzg/minecraft-server:latest",
+    defaultInvocation: "java -Xms512M -Xmx{{SERVER_MEMORY}}M -jar server.jar"
   });
 
   const fetchNodes = async (background = false) => {
@@ -201,7 +204,10 @@ export default function Nodes() {
         location: "Default",
         memory: 8192,
         disk: 50000,
-        cpuLimit: 100
+        cpuLimit: 100,
+        runtimeBackend: "docker",
+        defaultImage: "itzg/minecraft-server:latest",
+        defaultInvocation: "java -Xms512M -Xmx{{SERVER_MEMORY}}M -jar server.jar"
       });
       fetchNodes();
       if (res.data?.node) {
@@ -561,6 +567,57 @@ export default function Nodes() {
                     className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
                     placeholder="Germany"
                   />
+                </div>
+              </div>
+
+              <div className="border-t border-border pt-4">
+                <div className="text-xs font-mono uppercase tracking-wider text-muted-foreground mb-1">
+                  Game server defaults
+                </div>
+                <p className="text-[11px] text-muted-foreground mb-4">
+                  Servers on this node cannot be started until an image and invocation are set.
+                </p>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Runtime Backend</label>
+                    <select
+                      value={formData.runtimeBackend}
+                      onChange={e => setFormData({ ...formData, runtimeBackend: e.target.value })}
+                      className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                    >
+                      <option value="docker">Docker (containers)</option>
+                      <option value="process">Process (no container)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Default Image</label>
+                    <input
+                      type="text"
+                      value={formData.defaultImage}
+                      onChange={e => setFormData({ ...formData, defaultImage: e.target.value })}
+                      className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                      placeholder="itzg/minecraft-server:latest"
+                    />
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      Leave empty to require an image on every server.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs font-mono uppercase tracking-wider text-muted-foreground">Default Invocation</label>
+                    <input
+                      type="text"
+                      value={formData.defaultInvocation}
+                      onChange={e => setFormData({ ...formData, defaultInvocation: e.target.value })}
+                      className="w-full rounded-xl border border-border bg-background p-3 text-sm text-foreground focus:border-theme-500 focus:outline-none"
+                      placeholder="java -Xms512M -Xmx{{SERVER_MEMORY}}M -jar server.jar"
+                    />
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      {"Use {{SERVER_MEMORY}} to scale the heap with the server's memory limit."}
+                    </p>
+                  </div>
                 </div>
               </div>
 

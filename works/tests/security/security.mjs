@@ -143,13 +143,28 @@ section("Path traversal is contained");
     "..",
     "sub/../../other",
     "a/../../b",
-    "/etc/passwd",
-    "/srv/.data/servers/abc/../../../../root/.ssh/id_rsa",
     "a\0b",
     "/a/b/../../../../../../etc/shadow",
   ];
   for (const input of blocked) {
     check(`blocks ${JSON.stringify(input)}`, resolveWithin(base, input) === null);
+  }
+
+  // A leading slash is the server root, not the filesystem root (the file
+  // manager sends "/" and "/plugins"). These therefore resolve *inside* the
+  // server directory instead of being rejected. The property that matters is
+  // containment, and that the result is never the real system path.
+  for (const input of ["/etc/passwd", "/srv/.data/servers/abc/../../../../root/.ssh/id_rsa"]) {
+    const resolved = resolveWithin(base, input);
+    const contained =
+      resolved !== null &&
+      !path.relative(path.resolve(base), resolved).startsWith("..") &&
+      !path.isAbsolute(path.relative(path.resolve(base), resolved));
+    check(`contains ${JSON.stringify(input)}`, contained, String(resolved));
+    check(
+      `never resolves ${JSON.stringify(input)} to the real system path`,
+      resolved !== path.resolve(input)
+    );
   }
 
   const allowed = ["ok.txt", "sub/ok.txt", "a/b/../c", "...", "..foo", "", undefined];
@@ -240,6 +255,49 @@ section("rate limiter helper");
   check("secretsMatch accepts an identical secret", rl.secretsMatch("s3cret", "s3cret") === true);
   check("secretsMatch rejects non-strings", rl.secretsMatch(null, "x") === false);
   check("secretsMatch rejects undefined", rl.secretsMatch(undefined, undefined) === false);
+}
+
+// ------------------------------------------------------------- File manager paths
+section("File-manager paths are server-root relative");
+
+{
+  const safePath = await import(path.join(ROOT, "src/server/utils/safePath.ts"));
+  const { resolveWithin, isValidServerId, getServerDir } = safePath;
+  const base = path.join(sandbox, "srv-abc");
+
+  // A leading slash means "the server root". Without this the panel 400s every
+  // ordinary listing, which is what the file manager sends for "/" and
+  // "/plugins".
+  check("resolves the server root", resolveWithin(base, "/") === path.resolve(base));
+  check("resolves a leading-slash subdirectory", resolveWithin(base, "/plugins") === path.join(path.resolve(base), "plugins"));
+  check(
+    "resolves a nested leading-slash path",
+    resolveWithin(base, "/plugins/Server/server.properties") ===
+      path.join(path.resolve(base), "plugins/Server/server.properties")
+  );
+  check("resolves a relative path", resolveWithin(base, "plugins") === path.join(path.resolve(base), "plugins"));
+  check("empty path resolves to the server root", resolveWithin(base, "") === path.resolve(base));
+  check("undefined path resolves to the server root", resolveWithin(base, undefined) === path.resolve(base));
+
+  // Containment must survive the normalisation above.
+  check("still blocks ../ escape", resolveWithin(base, "/../etc") === null);
+  check("still blocks deep ../ escape", resolveWithin(base, "../../etc/passwd") === null);
+  check(
+    "contains rather than escapes for /etc/passwd/../shadow",
+    resolveWithin(base, "/etc/passwd/../shadow") === path.join(path.resolve(base), "etc/shadow"),
+    String(resolveWithin(base, "/etc/passwd/../shadow"))
+  );
+  check("still blocks NUL bytes", resolveWithin(base, "/a\0b") === null);
+  check("still blocks non-strings", resolveWithin(base, 123) === null);
+  check("blocks traversal hidden after a normal segment", resolveWithin(base, "/plugins/../../secret") === null);
+
+  // Server ids come from the panel; anything else is hostile.
+  check("accepts a normal server id", isValidServerId("3e4c92f0-555f-49d3-9979-c9f9c33a9bd6") === true);
+  check("rejects .. as a server id", isValidServerId("..") === false);
+  check("rejects a traversal server id", isValidServerId("../../etc") === false);
+  check("rejects a server id with a slash", isValidServerId("a/b") === false);
+  check("rejects an empty server id", isValidServerId("") === false);
+  check("getServerDir rejects a traversal id", getServerDir("../../etc") === null);
 }
 
 await fs.remove(sandbox);

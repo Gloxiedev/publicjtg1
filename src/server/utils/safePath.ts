@@ -39,12 +39,19 @@ export const getServerDir = (id: unknown): string | null => {
 export const resolveWithin = (baseDir: string, relative: unknown): string | null => {
   if (relative === undefined || relative === null) relative = "";
   if (typeof relative !== "string") return null;
-  // Reject NUL bytes and absolute paths outright rather than relying on
-  // normalisation to notice.
+  // Reject NUL bytes outright rather than relying on normalisation to notice.
   if (relative.includes("\0")) return null;
 
   const resolvedBase = path.resolve(baseDir);
-  const target = path.resolve(resolvedBase, relative);
+  // File-manager paths are *server-root-relative* and conventionally start with
+  // a slash ("/", "/plugins", "/plugins/Server/server.properties"). Feeding
+  // that to path.resolve made it treat "/" as the filesystem root, so the panel
+  // rejected every ordinary listing with 400 "Invalid path". Strip the leading
+  // separators and interpret them as "start at the server root".
+  //
+  // Containment is still enforced below, so "../../etc/passwd" is refused.
+  const cleaned = relative.replace(/^[/\\]+/, "");
+  const target = path.resolve(resolvedBase, cleaned);
   const rel = path.relative(resolvedBase, target);
 
   // rel === "" is the base itself, which is valid. Anything outside means rel is

@@ -467,6 +467,29 @@ export const startServer = async (req: Request, res: Response) => {
     const serverDir = path.join(process.cwd(), ".data", "servers", server.id);
     await fs.ensureDir(serverDir);
 
+    // Preflight: a server with neither its own image nor a configured default
+    // can never start, and the runtime failure that follows is opaque ("failed
+    // to remain running"). Fail with the actual missing setting instead.
+    if (!server.image && !server.invocation) {
+      try {
+        const nodes = (await readJSON("nodes.json")) || [];
+        const node = nodes.find((n: any) => n.id === server.nodeId);
+        const missing: string[] = [];
+        if (!server.image && !node?.defaultImage) missing.push("default image");
+        if (!server.invocation && !node?.defaultInvocation) missing.push("default invocation");
+        if (missing.length) {
+          return res.status(400).json({
+            error:
+              `This server has no ${missing.join(" or ")} configured. ` +
+              `Set a default image and invocation on node "${node?.name || server.nodeId}", ` +
+              `or set them on the server, then start it again.`,
+          });
+        }
+      } catch {
+        // Never let the preflight itself mask a start attempt.
+      }
+    }
+
     // If server has a mock container ID or missing container ID, and Docker is now enabled, recreate real container
     const isMockId = !server.containerId || server.containerId.startsWith("mock-container-id-");
     const isSandboxTarget = await checkNodeSandbox(server.nodeId);
