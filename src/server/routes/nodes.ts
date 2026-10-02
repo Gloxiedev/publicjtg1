@@ -149,6 +149,65 @@ function resolvePanelUrl(req: Request): string {
   }
 }
 
+/**
+ * The YAML block the installer writes into the daemon's config.yml.
+ *
+ * Shared with GET /api/wings/config so a running daemon can pick up node
+ * changes instead of being pinned to whatever the config said at install time.
+ */
+function buildNodeConfigYaml(node: any, allocations: any[]): string {
+  return [
+    `bind_address: "0.0.0.0"`,
+    `heartbeat_interval: ${node.heartbeatInterval || 15000}`,
+    `offline_threshold: ${node.offlineThreshold || 90000}`,
+    `runtime_backend: "${node.runtimeBackend || "docker"}"`,
+    `server_memory: ${node.memory || 1024}`,
+    `default_image: "${node.defaultImage || ""}"`,
+    `default_invocation: ${node.defaultInvocation ? JSON.stringify(String(node.defaultInvocation)) : '""'}`,
+    `tls_cert: "${node.tlsCert || ""}"`,
+    `tls_key: "${node.tlsKey || ""}"`,
+    `allocations: '${JSON.stringify(
+      allocations.map((a: any) => ({ id: a.id, ip: a.ip, port: Number(a.port) }))
+    )}'`,
+  ].join("\n");
+}
+
+/**
+ * Live node configuration for an already-registered daemon.
+ *
+ * Authenticated with the node's own api_secret. The installer writes config.yml
+ * once at install time, so without this an operator who edits a node's runtime
+ * backend or default image sees no effect until they re-run the installer on
+ * every node. The daemon polls this and keeps working from its local copy when
+ * the panel is unreachable.
+ */
+router.get("/config", heartbeatLimiter, async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
+    if (!bearerToken) {
+      return res.status(401).json({ error: "Unauthorized: Missing authentication" });
+    }
+
+    const nodes = await getNodesList();
+    const node = nodes.find((n: any) => secretsMatch(n.apiSecret, bearerToken));
+    if (!node) {
+      return res.status(401).json({ error: "Unauthorized: Invalid node credentials" });
+    }
+
+    const allocations = Array.isArray(node.allocations) ? node.allocations : [];
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      success: true,
+      nodeId: node.id,
+      config: buildNodeConfigYaml(node, allocations)
+    });
+  } catch (err: any) {
+    console.error("Error serving node config:", err);
+    res.status(500).json({ error: "Failed to load node configuration" });
+  }
+});
+
 router.get("/daemon.js", async (_req, res) => {
   try {
     const { content } = await getWingsDaemonSource();
@@ -209,20 +268,7 @@ router.post("/register", registerLimiter, async (req, res) => {
 
     await saveNodesList(nodes);
 
-    const nodeConfigYaml = [
-      `bind_address: "0.0.0.0"`,
-      `heartbeat_interval: ${node.heartbeatInterval || 15000}`,
-      `offline_threshold: ${node.offlineThreshold || 90000}`,
-      `runtime_backend: "${node.runtimeBackend || "docker"}"`,
-      `server_memory: ${node.memory || 1024}`,
-      `default_image: "${node.defaultImage || ""}"`,
-      `default_invocation: ${node.defaultInvocation ? JSON.stringify(String(node.defaultInvocation)) : '""'}`,
-      `tls_cert: "${node.tlsCert || ""}"`,
-      `tls_key: "${node.tlsKey || ""}"`,
-      `allocations: '${JSON.stringify(
-        allocations.map((a: any) => ({ id: a.id, ip: a.ip, port: Number(a.port) }))
-      )}'`,
-    ].join("\n");
+    const nodeConfigYaml = buildNodeConfigYaml(node, allocations);
 
     return res.json({
       success: true,

@@ -633,6 +633,86 @@ function postJson(target, pathname, payload, headers) {
   });
 }
 
+function getJson(target, pathname, headers) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try {
+      url = new URL(pathname, target);
+    } catch (e) {
+      return reject(e);
+    }
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.request(url, { method: 'GET', headers: { ...headers }, timeout: 10000 }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error('invalid JSON from panel'));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.end();
+  });
+}
+
+/**
+ * Re-read the node's configuration from the panel.
+ *
+ * config.yml is written once by the installer, so without this an operator who
+ * changes a node's runtime backend or default image sees no effect until they
+ * re-run the installer on every node. Applies the panel's values to the live
+ * config; local values are kept if the panel is unreachable, so an unreachable
+ * panel never stops a running daemon.
+ */
+async function refreshConfigFromPanel() {
+  try {
+    const res = await getJson(config.panelUrl, '/api/wings/config', {
+      Authorization: `Bearer ${config.apiSecret}`,
+    });
+    if (!res || res.success !== true || typeof res.config !== 'string' || !res.config.trim()) {
+      return false;
+    }
+    const parsed = parseSimpleYaml(res.config);
+    const changed = [];
+
+    if (parsed.runtime_backend && parsed.runtime_backend !== config.runtimeBackend) {
+      changed.push(`runtime_backend ${config.runtimeBackend} -> ${parsed.runtime_backend}`);
+      config.runtimeBackend = parsed.runtime_backend;
+    }
+    if (typeof parsed.default_image === 'string' && parsed.default_image !== config.defaultImage) {
+      changed.push(`default_image ${JSON.stringify(config.defaultImage)} -> ${JSON.stringify(parsed.default_image)}`);
+      config.defaultImage = parsed.default_image;
+    }
+    if (typeof parsed.default_invocation === 'string' && parsed.default_invocation !== config.defaultInvocation) {
+      changed.push('default_invocation updated');
+      config.defaultInvocation = parsed.default_invocation;
+    }
+    if (parsed.server_memory && Number(parsed.server_memory) !== config.serverMemory) {
+      changed.push(`server_memory ${config.serverMemory} -> ${Number(parsed.server_memory)}`);
+      config.serverMemory = Number(parsed.server_memory);
+    }
+    if (Array.isArray(parsed.allocations)) {
+      allocations = parsed.allocations;
+    }
+
+    if (changed.length) {
+      log('info', `applied config change from panel: ${changed.join(', ')}`);
+    } else {
+      log('debug', 'config is in sync with the panel');
+    }
+    return true;
+  } catch (e) {
+    log('warn', `could not refresh config from panel: ${e.message} (continuing with local config)`);
+    return false;
+  }
+}
+
 async function sendHeartbeat() {
   try {
     const payload = await heartbeatPayload();
@@ -962,6 +1042,12 @@ async function main() {
   listen(server);
   await sendHeartbeat();
   setInterval(sendHeartbeat, config.heartbeatInterval).unref();
+
+  // Pick up node edits (runtime backend, default image/invocation, allocations)
+  // without requiring the installer to be re-run on every node. Runs on the same
+  // cadence as the heartbeat so one request pattern is enough to stay in sync.
+  await refreshConfigFromPanel();
+  setInterval(refreshConfigFromPanel, Math.max(config.heartbeatInterval, 30000)).unref();
 
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => {
