@@ -124,6 +124,7 @@ export class WingsRuntimeProvider implements GameServerRuntimeProvider {
       skip_egg_scripts: true,
       build: {
         memory: server.ram || node.memory || 1024,
+        eula: server.eula !== false,
         swap: 0,
         io: 500,
         cpu: server.cpu || 100,

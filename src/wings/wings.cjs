@@ -294,6 +294,17 @@ async function backendCreate(record) {
 
   const name = dockerName(record.uuid);
   const alloc = record.allocation;
+
+  // Minecraft images refuse to boot until the EULA is accepted, so a server
+  // provisioned on Wings used to exit immediately with code 1. The panel's own
+  // sandbox backend already accepts it for the operator; Wings must match, or
+  // the same server works locally and dies on a real node.
+  const dir = serverDir(record.uuid);
+  await fsp.mkdir(dir, { recursive: true });
+  if (record.build?.eula !== false) {
+    await fsp.writeFile(path.join(dir, 'eula.txt'), 'eula=true\n', 'utf8');
+  }
+
   const args = ['create', '-i', '--name', name];
   const memory = `${record.build?.memory || config.serverMemory}m`;
   args.push('--memory', memory);
