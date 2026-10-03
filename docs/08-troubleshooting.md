@@ -81,6 +81,39 @@ newgrp docker
 The installer never runs `chmod 666 /var/run/docker.sock`. A world-writable
 Docker socket means any local process can start a privileged container.
 
+### Installer sits on "Setting up Cloudflare Tunnel" for minutes
+
+```
+Setting up Cloudflare Tunnel for panel.example.com...
+```
+
+Not a hang in older builds: `cloudflared tunnel login` opens a browser and waits
+for you to authorise. On a headless VPS no browser can complete it, so it waited
+out the full timeout printing nothing.
+
+Since `99568cf` it prints the authorisation URL while it waits and says so
+before starting. If you are on an older copy, `Ctrl+C` and either:
+
+```bash
+# Open the URL it prints, from any machine, then re-run
+```
+
+or skip the interactive login entirely with a tunnel token:
+
+```bash
+# Zero Trust -> Networks -> Tunnels -> create -> copy the install command token
+bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) \
+  --yes --exposure cloudflare --panel-domain panel.example.com \
+  --cloudflare-token "<token>"
+```
+
+or skip Cloudflare and expose the panel directly:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh) \
+  --yes --exposure direct
+```
+
 ### Cloudflare returns 502
 
 The tunnel origin and the panel must agree on the port. Compare the ingress
