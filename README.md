@@ -137,15 +137,32 @@ IPv4.
 1. **Install the panel** on your main server.
 2. **Create a node** in the panel: *Nodes → Create Wings Node*. Enter the name,
    FQDN/hostname, public IPv4, Wings port (default `8080`), memory and disk.
+   The runtime backend, default image and default invocation set here apply to
+   every server on the node, and a running Wings picks up later changes on its
+   own — reinstalling is not needed to change them.
 3. **Install Wings** on that VPS. The panel shows a command with a single-use
    registration token:
 
    ```bash
-   curl -fsSL https://panel.example.com/api/wings/install | bash -s -- <REGISTRATION_TOKEN>
+   curl -fsSL https://panel.example.com/api/wings/install | sudo bash -s -- <REGISTRATION_TOKEN>
    ```
 
    The token works once. Wings registers with the panel and installs a
-   `jtg-wings` systemd service; the node turns **ONLINE**.
+   `wings` systemd service; the node turns **ONLINE**. The script must run as
+   root, so pipe it through `sudo` (older builds were documented without it and
+   exited immediately).
+
+   To pin an exact revision, or to fetch the script straight from GitHub, pass the
+   panel address yourself:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/src/wings/wings-install.sh \
+     | sudo bash -s -- <REGISTRATION_TOKEN> --panel https://panel.example.com
+   ```
+
+   `sudo wingsctl status`, `journalctl -u wings` and `systemctl restart wings`
+   manage the daemon afterwards. Releases before `983c648` installed a
+   `jtg-wings.service` unit; that name still works as an alias.
 4. **Deploy** with *Deploy Instance*, choosing the node and a port allocation.
 
 ### Wings networking
@@ -154,6 +171,11 @@ IPv4.
   registered, so Wings must be reachable from the panel host.
 - **Players → Wings** is inbound to the game ports. These must be open in the
   node's firewall and security group, and must not go through Cloudflare.
+- Game ports are published on the allocation address when the node really owns
+  it, and otherwise on `0.0.0.0`. That second case is what makes nodes behind
+  cloud NAT work: on AWS an Elastic IP is not configured on any local
+  interface, so binding it directly fails with `cannot assign requested
+  address`.
 - If the panel is on a loopback-only host behind a Tunnel, that is fine: the
   tunnel is only for people using the web UI. Wings talks to the panel's public
   HTTPS URL.
