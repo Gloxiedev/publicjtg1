@@ -8,6 +8,9 @@ The panel never touches a game container directly — it talks to Wings over HTT
 
 ---
 
+Full setup documentation, from empty machine to game servers running, is in
+[`docs/`](docs/README.md).
+
 ## Quick install
 
 One command on a fresh Ubuntu or Debian server:
@@ -349,7 +352,7 @@ The tunnel origin and the panel must agree on the port. Check the ingress
 `service:` in `/etc/cloudflared/config.yml` against `PORT` in `.env`.
 
 **A node stays OFFLINE.**
-Check Wings on that host: `systemctl status jtg-wings`, `journalctl -u jtg-wings`.
+Check Wings on that host: `systemctl status wings`, `journalctl -u wings`.
 Confirm the panel can reach the node's public IP on the Wings port, and that the
 registration token was not already used.
 
