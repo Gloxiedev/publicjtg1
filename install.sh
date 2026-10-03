@@ -31,7 +31,7 @@ NC='\033[0m'
 # Printed at startup so it is always obvious which build is running. Several
 # "the installer is stuck" reports turned out to be an old copy still sitting on
 # disk or behind a proxy cache.
-INSTALLER_VERSION="35af69c"
+INSTALLER_VERSION="2026.10.03-tunnel-pty"
 
 REPO_URL="https://github.com/Gloxiedev/publicjtg1.git"
 REPO_DIR_NAME="jtgsecret"
@@ -665,41 +665,32 @@ configure_tunnel_via_login() {
         log_warning ""
     fi
 
-    # Stream the log while cloudflared waits, so the authorisation URL appears
-    # immediately instead of the script looking stuck. Deliberately not a
-    # pipeline: install.sh has no `set -o pipefail`, so `$?` after `cmd | tee`
-    # would be tee's status and a failed login would read as success.
-    local login_log="/tmp/jtg-cf-login.log"
-    local login_status=0 login_offset=0
-    : > "$login_log"
-    timeout 180 cloudflared tunnel login > "$login_log" 2>&1 &
-    local login_pid=$!
-
-    while kill -0 "$login_pid" 2>/dev/null; do
-        if [ -s "$login_log" ]; then
-            local size
-            size="$(wc -c < "$login_log" 2>/dev/null || echo 0)"
-            if [ "$size" -gt "$login_offset" ]; then
-                tail -c "+$((login_offset + 1))" "$login_log"
-                login_offset="$size"
-            fi
-        fi
-        sleep 2
-    done
-    wait "$login_pid" || login_status=$?
+    # cloudflared is a Go program: when its output is not a terminal it buffers,
+    # so redirecting to a file meant the authorisation URL stayed in the buffer
+    # and only appeared once the process was killed -- after the error. Give it a
+    # real pty via script(1) so the URL is printed the moment it is produced.
+    local login_status=0
+    if command -v script > /dev/null 2>&1; then
+        script -qec "timeout 180 cloudflared tunnel login" /dev/null || login_status=$?
+    else
+        # No script(1): fall back to plain output. Still correct, but the URL may
+        # not appear until cloudflared exits.
+        log_warning "script(1) not found; the authorisation URL may not appear until the attempt ends."
+        timeout 180 cloudflared tunnel login || login_status=$?
+    fi
 
     if [ "$login_status" -ne 0 ]; then
         log_error "cloudflared tunnel login failed (exit ${login_status})."
         [ "$login_status" -eq 124 ] && log_error "Timed out after 180s waiting for the browser login."
         [ "$login_status" -eq 124 ] && log_error "No authorisation arrived, so nothing was configured."
-        rm -f "$login_log"
+        [ "$login_status" -eq 124 ] && log_error "On a headless host this login cannot complete: nothing opened the URL."
+        log_error "The panel is not installed yet. Nothing was changed, so you can re-run safely."
         log_error ""
         log_error "Fastest path: create a tunnel in the dashboard, copy its token,"
         log_error "then re-run with --cloudflare-token \"<token>\"."
         log_error "Or install with --exposure direct and put your own TLS in front."
         return 1
     fi
-    rm -f "$login_log"
     log_success "Authenticated with Cloudflare."
 
     # Reuse the tunnel if the operator named an existing one, otherwise create it.
