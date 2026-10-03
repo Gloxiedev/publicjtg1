@@ -28,6 +28,11 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Printed at startup so it is always obvious which build is running. Several
+# "the installer is stuck" reports turned out to be an old copy still sitting on
+# disk or behind a proxy cache.
+INSTALLER_VERSION="672fa71"
+
 REPO_URL="https://github.com/Gloxiedev/publicjtg1.git"
 REPO_DIR_NAME="jtgsecret"
 INSTALL_ROOT="${JTG_INSTALL_ROOT:-$HOME/jtgsecret}"
@@ -182,6 +187,7 @@ print_banner() {
     echo "║                                              ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
+    echo -e "  ${CYAN}build ${INSTALLER_VERSION}${NC}"
 }
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
