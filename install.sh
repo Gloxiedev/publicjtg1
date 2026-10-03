@@ -642,19 +642,58 @@ configure_tunnel_via_login() {
     local tunnel_id=""
 
     log_warning "No tunnel token supplied, so an interactive Cloudflare login is required."
-    log_warning "This opens a browser window. Press Ctrl+C to abort and use --cloudflare-token instead."
+    log_warning "cloudflared will print a URL. Open it in a browser to authorise,"
+    log_warning "then come back here. On a headless server the URL does not open"
+    log_warning "automatically, so copy it to your own machine."
+    log_warning "Press Ctrl+C at any time to abort and use --cloudflare-token instead."
+    log_warning ""
 
-    local login_out
-    if ! login_out="$(timeout 300 cloudflared tunnel login 2>&1)"; then
-        local status=$?
-        log_error "cloudflared tunnel login failed (exit ${status})."
-        echo "$login_out" | tail -n 15
-        if [ "$status" -eq 124 ]; then
-            log_error "Timed out after 300s waiting for the browser login."
+    # Headless hosts have a TTY but no browser, which is the combination that
+    # made this look like a hang: the wait was real, the login was not coming.
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] \
+        && [ "$(uname -s)" != "Darwin" ] && [ -z "${WSL_DISTRO_NAME:-}" ]; then
+        log_warning "This looks like a headless host (no DISPLAY/WAYLAND_DISPLAY), so"
+        log_warning "the login page cannot open here. Authorise from another device"
+        log_warning "using the URL below, or skip this and re-run with a token:"
+        log_warning "  --cloudflare-token \"<token>\""
+        log_warning ""
+    fi
+
+    # Stream the log while cloudflared waits, so the authorisation URL appears
+    # immediately instead of the script looking stuck. Deliberately not a
+    # pipeline: install.sh has no `set -o pipefail`, so `$?` after `cmd | tee`
+    # would be tee's status and a failed login would read as success.
+    local login_log="/tmp/jtg-cf-login.log"
+    local login_status=0 login_offset=0
+    : > "$login_log"
+    timeout 180 cloudflared tunnel login > "$login_log" 2>&1 &
+    local login_pid=$!
+
+    while kill -0 "$login_pid" 2>/dev/null; do
+        if [ -s "$login_log" ]; then
+            local size
+            size="$(wc -c < "$login_log" 2>/dev/null || echo 0)"
+            if [ "$size" -gt "$login_offset" ]; then
+                tail -c "+$((login_offset + 1))" "$login_log"
+                login_offset="$size"
+            fi
         fi
-        log_error "Alternative: create a tunnel in the dashboard and re-run with --cloudflare-token."
+        sleep 2
+    done
+    wait "$login_pid" || login_status=$?
+
+    if [ "$login_status" -ne 0 ]; then
+        log_error "cloudflared tunnel login failed (exit ${login_status})."
+        [ "$login_status" -eq 124 ] && log_error "Timed out after 180s waiting for the browser login."
+        [ "$login_status" -eq 124 ] && log_error "No authorisation arrived, so nothing was configured."
+        rm -f "$login_log"
+        log_error ""
+        log_error "Fastest path: create a tunnel in the dashboard, copy its token,"
+        log_error "then re-run with --cloudflare-token \"<token>\"."
+        log_error "Or install with --exposure direct and put your own TLS in front."
         return 1
     fi
+    rm -f "$login_log"
     log_success "Authenticated with Cloudflare."
 
     # Reuse the tunnel if the operator named an existing one, otherwise create it.
