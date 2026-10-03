@@ -31,7 +31,9 @@ function getWingsClient(node: any) {
       "Accept": "application/json",
       "Content-Type": "application/json"
     },
-    timeout: 15000,
+    // Must exceed the daemon's longest operation (a container stop) so a slow
+    // stop surfaces as a real error instead of an opaque client timeout.
+    timeout: 45000,
     validateStatus: (status: number) => status < 500
   });
 }

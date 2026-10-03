@@ -388,7 +388,11 @@ function wireConsole(record, child) {
   consoleStreams.set(record.uuid, child.stdin);
 }
 
-async function backendStop(record, timeoutSec = 20) {
+// Kept below the panel's 15s Wings HTTP timeout on purpose. Docker waits the
+// full grace period for SIGTERM before escalating, so a longer grace here meant
+// the panel timed out first and every stop came back as a 500 even though the
+// container did eventually stop.
+async function backendStop(record, timeoutSec = 10) {
   if (config.runtimeBackend === 'process') {
     const stream = consoleStreams.get(record.uuid);
     if (stream && !stream.destroyed) stream.write('stop\n');
@@ -408,6 +412,8 @@ async function backendStop(record, timeoutSec = 20) {
   const state = await dockerInspect(record.container_name);
   if (state && state.Running) {
     await run('docker', ['stop', '-t', String(timeoutSec), record.container_name]);
+  } else if (state) {
+    await run('docker', ['rm', '-f', record.container_name]).catch(() => {});
   }
   closeConsole(record.uuid);
   record.state = 'offline';
