@@ -31,7 +31,7 @@ NC='\033[0m'
 # Printed at startup so it is always obvious which build is running. Several
 # "the installer is stuck" reports turned out to be an old copy still sitting on
 # disk or behind a proxy cache.
-INSTALLER_VERSION="672fa71"
+INSTALLER_VERSION="35af69c"
 
 REPO_URL="https://github.com/Gloxiedev/publicjtg1.git"
 REPO_DIR_NAME="jtgsecret"
