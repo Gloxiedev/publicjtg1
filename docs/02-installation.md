@@ -10,6 +10,30 @@ The installer is idempotent. It preserves an existing `.env` (so your JWT secret
 and sessions survive), reuses the running PM2 process, and reconfigures the
 Cloudflare tunnel in place.
 
+## Check which build you are running
+
+The banner prints a build marker under the logo. It is the fastest way to tell a
+current installer from a stale one — `raw.githubusercontent.com` is served
+through a CDN with a 5 minute cache, so a URL fetched moments after a push can
+still return the previous version.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh | grep INSTALLER_VERSION=
+```
+
+To pin an exact revision and skip the cache:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/f45e93f/install.sh))
+```
+
+or clone:
+
+```bash
+git clone --depth 1 https://github.com/Gloxiedev/publicjtg1.git
+bash publicjtg1/install.sh
+```
+
 ## Options
 
 ### General

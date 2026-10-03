@@ -91,8 +91,42 @@ Not a hang in older builds: `cloudflared tunnel login` opens a browser and waits
 for you to authorise. On a headless VPS no browser can complete it, so it waited
 out the full timeout printing nothing.
 
-Since `99568cf` it prints the authorisation URL while it waits and says so
-before starting. If you are on an older copy, `Ctrl+C` and either:
+Since `f45e93f` the authorisation URL is printed the moment `cloudflared`
+produces it, because it runs under a pty and no longer buffers its output. Open
+that URL from any device — phone, laptop, anything with a browser — approve it,
+and the installer continues on its own. If you never saw the URL, check the
+build marker below first.
+
+The banner prints a build string. If yours does not read
+`2026.10.03-tunnel-pty`, you are running an old copy:
+
+```
+  build 2026.10.03-tunnel-pty
+```
+
+To see what a URL will actually give you before committing to it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/install.sh | grep INSTALLER_VERSION=
+```
+
+**`main` is served through a CDN with a 5 minute cache.** Right after a push,
+`raw.githubusercontent.com/.../main/install.sh` can still return the previous
+version for several minutes — `x-cache: HIT` in the response headers is the
+tell. If you are not sure which build you have, pin the commit:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/f45e93f/install.sh)
+```
+
+or clone, which bypasses the CDN entirely:
+
+```bash
+git clone --depth 1 https://github.com/Gloxiedev/publicjtg1.git
+bash publicjtg1/install.sh
+```
+
+If you are on an older copy, `Ctrl+C` and either:
 
 ```bash
 # Open the URL it prints, from any machine, then re-run
