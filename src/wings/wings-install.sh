@@ -2,7 +2,9 @@
 # JTG Panel - Wings node installer
 #
 # Usage:
-#   curl -fsSL <panel>/api/wings/install | bash -s -- <REGISTRATION_TOKEN> [options]
+#   curl -fsSL <panel>/api/wings/install | sudo bash -s -- <REGISTRATION_TOKEN>
+#   curl -fsSL https://raw.githubusercontent.com/Gloxiedev/publicjtg1/main/src/wings/wings-install.sh \
+#     | sudo bash -s -- <REGISTRATION_TOKEN> --panel <PANEL_URL>
 #
 # Production (default): installs dependencies with sudo and registers a systemd
 # service named "wings". The installer verifies the service actually reached a
@@ -38,7 +40,10 @@ LOG_DIR="/var/log/jtg-wings"
 START_MODE="service"
 OVERRIDE_PORT=""
 TOKEN=""
-PANEL_URL="@PANEL_URL@"
+# Substituted with the real panel address when the panel serves this script. A
+# copy fetched straight from GitHub still carries the placeholder, so --panel or
+# PANEL_URL in the environment supplies it instead.
+PANEL_URL="${PANEL_URL:-@PANEL_URL@}"
 
 usage() {
   echo "Usage: wings-install.sh [REGISTRATION_TOKEN] [options]"
@@ -50,6 +55,8 @@ usage() {
   echo "  --data-dir <path>   Wings data directory (default /var/lib/jtg-wings)"
   echo "  --log-dir <path>    Wings log directory (default /var/log/jtg-wings)"
   echo "  --port <port>       Override the Wings API port"
+  echo "  --panel <url>       Panel base URL. Required when this script was not"
+  echo "                      downloaded from <panel>/api/wings/install"
   echo "  --no-daemon         Run Wings in the foreground instead of as a service"
   echo "  --help              Show this help"
 }
@@ -69,6 +76,7 @@ while [ $# -gt 0 ]; do
     --data-dir) need_arg "$@"; DATA_DIR="$2"; shift 2 ;;
     --log-dir) need_arg "$@"; LOG_DIR="$2"; shift 2 ;;
     --port) need_arg "$@"; OVERRIDE_PORT="$2"; shift 2 ;;
+    --panel|--panel-url) need_arg "$@"; PANEL_URL="$2"; shift 2 ;;
     --no-daemon) START_MODE="foreground"; shift ;;
     --help|-h) usage; exit 0 ;;
     -*) die "Unknown option: $1" ;;
@@ -80,6 +88,14 @@ done
 if [ -n "$OVERRIDE_PORT" ] && ! { [ "$OVERRIDE_PORT" -ge 1 ] 2>/dev/null && [ "$OVERRIDE_PORT" -le 65535 ] 2>/dev/null; }; then
   die "--port must be a number between 1 and 65535 (got '$OVERRIDE_PORT')."
 fi
+
+PANEL_URL="${PANEL_URL%/}"
+case "$PANEL_URL" in
+  ""|@PANEL_URL@)
+    die "Panel URL is not set. Pass --panel https://your-panel.example.com, or set PANEL_URL." ;;
+  http://*|https://*) ;;
+  *) die "Panel URL must start with http:// or https:// (got '$PANEL_URL')." ;;
+esac
 
 if [ -z "$TOKEN" ] && [ -t 0 ]; then
   echo -ne "${YELLOW}Enter Node Registration Token: ${NC}"
