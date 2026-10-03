@@ -305,7 +305,11 @@ async function backendCreate(record) {
     await fsp.writeFile(path.join(dir, 'eula.txt'), 'eula=true\n', 'utf8');
   }
 
-  const args = ['create', '-i', '--name', name];
+  // The server directory has to be visible inside the container, otherwise the
+  // container runs against whatever /data the image ships with: the EULA file is
+  // ignored, the file manager edits a directory the game never reads, and every
+  // restart loses the world.
+  const args = ['create', '-i', '--name', name, '-v', `${dir}:/data`];
   const memory = `${record.build?.memory || config.serverMemory}m`;
   args.push('--memory', memory);
   const bindAddress = alloc && alloc.ip ? hostBindAddress(alloc.ip) : '0.0.0.0';
